@@ -265,7 +265,7 @@ async function runCycle() {
       confirmSeat();
 
       // 等票數頁載入，自動填 1 張並按下一步
-      await new Promise(r => setTimeout(r, 800));
+      await new Promise(r => setTimeout(r, 1200));
       fillTicketCount();
 
       window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'SEAT_FOUND', zone: zoneCode } }, '*');
