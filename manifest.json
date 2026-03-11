@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "NOL World 搶票助手",
+  "version": "1.0.0",
+  "description": "NOL World 自動刷票工具 - 區域輪詢、自動選位",
+  "permissions": [
+    "storage",
+    "notifications",
+    "tabs",
+    "sidePanel",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://gpoticket.globalinterpark.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [],
+  "action": {
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    },
+    "default_title": "NOL World 搶票助手"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
