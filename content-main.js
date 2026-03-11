@@ -187,50 +187,78 @@ function confirmSeat() {
   }
 }
 
-// ─── 票數頁：填 1 張並按下一步 ────────────────────────────
-function fillTicketCount() {
-  function tryFill(doc, depth) {
-    if (depth > 5) return false;
-    try {
-      const selects = doc.querySelectorAll('select[name="SeatCount"]');
-      if (selects.length > 0) {
-        selects.forEach(sel => {
-          sel.value = '1';
-          // 觸發 onchange（呼叫 fnSelectPrice）
-          sel.dispatchEvent(new Event('change', { bubbles: true }));
-        });
-        log(`✅ 已設定 ${selects.length} 個票數選單為 1 張`);
-
-        // 按下一步 — 按鈕在主頁面（非 iframe 內）
-        setTimeout(() => {
-          const btn = document.getElementById('SmallNextBtnLink')
-            || document.getElementById('LargeNextBtnLink')
-            || document.querySelector('a[href*="fnNextStep"]');
-          if (btn) {
-            btn.click();
-            log('✅ 已點擊下一步按鈕');
-          } else if (typeof window.fnNextStep === 'function') {
-            window.fnNextStep('P');
-            log('✅ 已呼叫 window.fnNextStep');
-          } else {
-            log('⚠️ 找不到下一步按鈕，請手動點擊');
-          }
-        }, 300);
-        return true;
-      }
-      for (const iframe of doc.querySelectorAll('iframe')) {
-        try {
-          if (tryFill(iframe.contentDocument, depth + 1)) return true;
-        } catch (_) {}
-      }
-    } catch (e) {
-      log(`fillTicketCount 失敗: ${e.message}`);
+// ─── 票數頁：輪詢等待 select 出現，填 1 張並按下一步 ──────
+function findSelectInDoc(doc, depth) {
+  if (depth > 5) return null;
+  try {
+    const selects = doc.querySelectorAll('select[name="SeatCount"]');
+    if (selects.length > 0) return { selects, doc };
+    for (const iframe of doc.querySelectorAll('iframe')) {
+      try {
+        const found = findSelectInDoc(iframe.contentDocument, depth + 1);
+        if (found) return found;
+      } catch (_) {}
     }
-    return false;
+  } catch (_) {}
+  return null;
+}
+
+async function fillTicketCount() {
+  // 等待 ifrmBookStep 載入新的 Price/Discount 頁面（load 事件）
+  // 不用輪詢，避免設到舊的 document
+  const bookStepIframe = document.getElementById('ifrmBookStep');
+
+  if (bookStepIframe) {
+    log('等待 Price/Discount 頁面載入...');
+    await new Promise((resolve) => {
+      const timer = setTimeout(resolve, 8000);
+      bookStepIframe.addEventListener('load', () => {
+        clearTimeout(timer);
+        resolve();
+      }, { once: true });
+    });
+    // 等頁面內部 JS（fnInit）初始化完成
+    await new Promise(r => setTimeout(r, 300));
+  } else {
+    // 備案：找不到 ifrmBookStep，改用輪詢
+    const timeout = 5000;
+    const start = Date.now();
+    while (Date.now() - start < timeout) {
+      if (findSelectInDoc(document, 0)) break;
+      await new Promise(r => setTimeout(r, 200));
+    }
   }
 
-  if (!tryFill(document, 0)) {
+  const found = findSelectInDoc(document, 0);
+  if (!found) {
     log('⚠️ 找不到票數選單，請手動選擇張數');
+    return;
+  }
+
+  const { selects, doc } = found;
+  const win = doc.defaultView || doc.parentWindow;
+  selects.forEach(sel => {
+    sel.value = '1';
+    if (win && typeof win.fnSelectPrice === 'function') {
+      win.fnSelectPrice(sel);
+    } else {
+      sel.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+  });
+  log(`✅ 已設定 ${selects.length} 個票數選單為 1 張`);
+
+  await new Promise(r => setTimeout(r, 300));
+  const btn = document.getElementById('SmallNextBtnLink')
+    || document.getElementById('LargeNextBtnLink')
+    || document.querySelector('a[href*="fnNextStep"]');
+  if (btn) {
+    btn.click();
+    log('✅ 已點擊下一步按鈕');
+  } else if (typeof window.fnNextStep === 'function') {
+    window.fnNextStep('P');
+    log('✅ 已呼叫 window.fnNextStep');
+  } else {
+    log('⚠️ 找不到下一步按鈕，請手動點擊');
   }
 }
 
@@ -264,8 +292,7 @@ async function runCycle() {
       await new Promise(r => setTimeout(r, 150));
       confirmSeat();
 
-      // 等票數頁載入，自動填 1 張並按下一步
-      await new Promise(r => setTimeout(r, 1200));
+      // 票數頁由 fillTicketCount 自行輪詢等待（最多 5 秒）
       fillTicketCount();
 
       window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'SEAT_FOUND', zone: zoneCode } }, '*');
