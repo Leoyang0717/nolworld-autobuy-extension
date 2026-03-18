@@ -29,7 +29,7 @@ function randomInterval() {
 
 // ─── 遞迴搜尋所有 iframe（含巢狀）找 fnBlockSeatUpdate ──
 function findWinWithFn(doc, depth) {
-  if (depth > 5) return null;
+  if (!doc || depth > 5) return null;
   try {
     const iframes = doc.querySelectorAll('iframe');
     for (const iframe of iframes) {
@@ -133,7 +133,7 @@ const SEAT_SELECTORS = [
 ];
 
 function searchSeatInDoc(doc, depth) {
-  if (depth > 5) return null;
+  if (!doc || depth > 5) return null;
   try {
     for (const sel of SEAT_SELECTORS) {
       try {
@@ -289,6 +289,32 @@ async function fillTicketCount() {
   }
 }
 
+// ─── 等待座位 iframe 載入完成 ────────────────────────────
+function waitForSeatLoad(timeout = 1500) {
+  return new Promise(resolve => {
+    const t0 = Date.now();
+    try {
+      const seatDoc = document.getElementById('ifrmSeat')?.contentDocument;
+      const detail = seatDoc?.getElementById('ifrmSeatDetail');
+      if (!detail) { setTimeout(resolve, 800); return; }
+
+      const timer = setTimeout(() => {
+        log(`iframe 載入逾時（>${timeout}ms）`);
+        resolve();
+      }, timeout);
+      detail.addEventListener('load', () => {
+        clearTimeout(timer);
+        setTimeout(() => {
+          log(`iframe 載入完成（${Date.now() - t0}ms）`);
+          resolve();
+        }, 150);
+      }, { once: true });
+    } catch (_) {
+      setTimeout(resolve, 800);
+    }
+  });
+}
+
 // ─── 主循環 ──────────────────────────────────────────────
 async function runCycle() {
   if (!isRunning) return;
@@ -317,7 +343,7 @@ async function runCycle() {
   const clicked = clickZone(zoneCode);
 
   if (clicked) {
-    await new Promise(r => setTimeout(r, 800));
+    await waitForSeatLoad();
     const seat = findAvailableSeat();
     if (seat) {
       log(`✅ 找到綠葡萄！區域 ${zoneCode}，點擊座位中...`);
