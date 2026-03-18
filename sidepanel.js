@@ -262,7 +262,7 @@ chrome.runtime.onMessage.addListener((msg) => {
       type: 'basic',
       iconUrl: 'icons/icon128.png',
       title: '⚠️ 出現驗證碼！',
-      message: '搶票已停止，請完成滑塊驗證後重新開始搶票',
+      message: '搶票已停止，請完成驗證後重新開始搶票',
       priority: 2,
     });
   }
