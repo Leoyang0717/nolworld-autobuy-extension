@@ -218,6 +218,9 @@ function handleStopped(reason) {
   if (reason === 'FOUND') {
     setStatus('✅ 找到綠葡萄！已自動點擊，請確認座位！', 'found');
     appendLog('🍇 找到綠葡萄！已點擊座位', 'found');
+  } else if (reason === 'CAPTCHA') {
+    setStatus('🔒 出現驗證碼，請手動完成驗證', 'error');
+    appendLog('🔒 偵測到驗證碼，已停止搶票', 'error');
   } else if (reason === 'TIMEOUT') {
     setStatus('⏱️ 時間到，已停止', 'idle');
     appendLog('⏱ 達到設定時間，已停止');
@@ -248,6 +251,18 @@ chrome.runtime.onMessage.addListener((msg) => {
       iconUrl: 'icons/icon128.png',
       title: 'NOL World 搶票成功！',
       message: `在 ${msg.zone} 區域找到綠葡萄，已自動點擊！請確認座位`,
+      priority: 2,
+    });
+  }
+
+  if (msg.action === 'CAPTCHA') {
+    handleStopped('CAPTCHA');
+    playAlertBeep();
+    chrome.notifications.create({
+      type: 'basic',
+      iconUrl: 'icons/icon128.png',
+      title: '⚠️ 出現驗證碼！',
+      message: '搶票已停止，請完成滑塊驗證後重新開始搶票',
       priority: 2,
     });
   }

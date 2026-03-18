@@ -98,6 +98,24 @@ function clickZone(zoneCode) {
   return false;
 }
 
+// ─── 驗證碼偵測 ──────────────────────────────────────────
+function findCaptchaInDoc(doc, depth) {
+  if (depth > 5) return false;
+  try {
+    const el = doc.querySelector('.captchSliderLayer');
+    if (el) {
+      const st = (doc.defaultView || doc.parentWindow)?.getComputedStyle(el);
+      if (!st || st.display !== 'none') return true;
+    }
+    for (const iframe of doc.querySelectorAll('iframe')) {
+      try {
+        if (findCaptchaInDoc(iframe.contentDocument, depth + 1)) return true;
+      } catch (_) {}
+    }
+  } catch (_) {}
+  return false;
+}
+
 // ─── 掃描綠葡萄（可用座位）────────────────────────────────
 // SeatN = 可選座位（綠色）、SeatR = 已售、SeatB = 隔位
 const SEAT_SELECTORS = [
@@ -269,6 +287,14 @@ async function runCycle() {
   if (config.durationMs > 0 && Date.now() - startTime > config.durationMs) {
     log(`已達設定時間，停止搶票`);
     stop('TIMEOUT');
+    return;
+  }
+
+  // 每輪開始前先偵測是否出現驗證碼
+  if (findCaptchaInDoc(document, 0)) {
+    log('🔒 偵測到驗證碼！停止搶票，請完成驗證後重新開始');
+    window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'CAPTCHA' } }, '*');
+    stop('CAPTCHA');
     return;
   }
 
