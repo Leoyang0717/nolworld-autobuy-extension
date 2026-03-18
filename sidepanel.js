@@ -245,7 +245,7 @@ chrome.runtime.onMessage.addListener((msg) => {
 
   if (msg.action === 'SEAT_FOUND') {
     handleStopped('FOUND');
-    playAlertBeep();
+    playFoundBeep();
     chrome.notifications.create({
       type: 'basic',
       iconUrl: 'icons/icon128.png',
@@ -257,7 +257,7 @@ chrome.runtime.onMessage.addListener((msg) => {
 
   if (msg.action === 'CAPTCHA') {
     handleStopped('CAPTCHA');
-    playAlertBeep();
+    playWarningBeep();
     chrome.notifications.create({
       type: 'basic',
       iconUrl: 'icons/icon128.png',
@@ -281,21 +281,42 @@ document.addEventListener('keydown', async e => {
 });
 
 // ─── 嗶嗶聲提示 ────────────────────────────────────────────
-function playAlertBeep() {
+// 搶到票：連嗶三聲高音（880Hz，興奮感）
+function playFoundBeep() {
   try {
     const ctx = new AudioContext();
-    const beepTimes = [0, 0.3, 0.6]; // 連嗶三聲
-    beepTimes.forEach(startAt => {
+    [0, 0.3, 0.6].forEach(startAt => {
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.connect(gain);
       gain.connect(ctx.destination);
       osc.type = 'sine';
-      osc.frequency.value = 880; // 高音 A
+      osc.frequency.value = 880;
       gain.gain.setValueAtTime(0.5, ctx.currentTime + startAt);
       gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + startAt + 0.2);
       osc.start(ctx.currentTime + startAt);
       osc.stop(ctx.currentTime + startAt + 0.2);
+    });
+  } catch (e) {
+    console.warn('無法播放提示音:', e);
+  }
+}
+
+// 驗證碼：兩聲低沉下降音（440→330Hz，警示感）
+function playWarningBeep() {
+  try {
+    const ctx = new AudioContext();
+    [{ start: 0, freq: 440 }, { start: 0.4, freq: 330 }].forEach(({ start, freq }) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.type = 'sine';
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.4, ctx.currentTime + start);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + start + 0.35);
+      osc.start(ctx.currentTime + start);
+      osc.stop(ctx.currentTime + start + 0.35);
     });
   } catch (e) {
     console.warn('無法播放提示音:', e);
