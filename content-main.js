@@ -102,21 +102,21 @@ function clickZone(zoneCode) {
 function findCaptchaInDoc(doc, depth) {
   if (depth > 5) return false;
   try {
+    // 偵測 NOL World 統一驗證遮罩（hCaptcha / reCAPTCHA 共用）
+    const wrap = doc.getElementById('divCaptchaWrap');
+    if (wrap && wrap.style.display !== 'none') {
+      const rect = wrap.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) return true;
+    }
+
+    // 偵測滑塊驗證
     const el = doc.querySelector('.captchSliderLayer');
     if (el) {
       const st = (doc.defaultView || doc.parentWindow)?.getComputedStyle(el);
       if (!st || st.display !== 'none') return true;
     }
+
     for (const iframe of doc.querySelectorAll('iframe')) {
-      try {
-        // 偵測 hCaptcha（cross-origin，只能透過 src 判斷）
-        // 用 getBoundingClientRect 確認真正可見（display:none 時寬高為 0）
-        const src = iframe.src || '';
-        if (src.includes('hcaptcha.com')) {
-          const rect = iframe.getBoundingClientRect();
-          if (rect.width > 0 && rect.height > 0) return true;
-        }
-      } catch (_) {}
       try {
         if (findCaptchaInDoc(iframe.contentDocument, depth + 1)) return true;
       } catch (_) {}
