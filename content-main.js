@@ -110,8 +110,12 @@ function findCaptchaInDoc(doc, depth) {
     for (const iframe of doc.querySelectorAll('iframe')) {
       try {
         // 偵測 hCaptcha（cross-origin，只能透過 src 判斷）
+        // 用 getBoundingClientRect 確認真正可見（display:none 時寬高為 0）
         const src = iframe.src || '';
-        if (src.includes('hcaptcha.com') && iframe.offsetParent !== null) return true;
+        if (src.includes('hcaptcha.com')) {
+          const rect = iframe.getBoundingClientRect();
+          if (rect.width > 0 && rect.height > 0) return true;
+        }
       } catch (_) {}
       try {
         if (findCaptchaInDoc(iframe.contentDocument, depth + 1)) return true;
