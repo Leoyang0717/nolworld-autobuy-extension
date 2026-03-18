@@ -305,3 +305,6 @@ function playAlertBeep() {
 // ─── 初始化 ─────────────────────────────────────────────────
 loadSettings();
 appendLog('NOL World 搶票助手已就緒');
+
+const { version } = chrome.runtime.getManifest();
+document.getElementById('versionLabel').textContent = `v${version}`;
