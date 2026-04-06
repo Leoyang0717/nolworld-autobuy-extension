@@ -3,6 +3,7 @@
 // ─── 狀態 ──────────────────────────────────────────────────
 let zones = [];
 let isRunning = false;
+let isWatching = false;
 let statsTimer = null;
 let startTimestamp = null;
 
@@ -16,6 +17,45 @@ const statsRow    = document.getElementById('statsRow');
 const attemptEl   = document.getElementById('attemptCount');
 const elapsedEl   = document.getElementById('elapsedTime');
 const logBox      = document.getElementById('logBox');
+
+// ─── 預約按鈕監聽 ──────────────────────────────────────────
+const watchReserveBtnEl     = document.getElementById('watchReserveBtn');
+const stopWatchReserveBtnEl = document.getElementById('stopWatchReserveBtn');
+
+async function sendToWatchTab(msg) {
+  const tab = await getWatchTab();
+  if (!tab) {
+    appendLog('找不到 tickets.interpark.com 預約頁面，請先開啟', 'error');
+    return null;
+  }
+  const ready = await ensureContentScript(tab.id);
+  if (!ready) return null;
+  try {
+    return await chrome.tabs.sendMessage(tab.id, msg);
+  } catch (e) {
+    appendLog(`訊息傳送失敗: ${e.message}`, 'error');
+    return null;
+  }
+}
+
+watchReserveBtnEl.addEventListener('click', async () => {
+  const res = await sendToWatchTab({ action: 'WATCH_RESERVE' });
+  if (!res?.ok) return;
+  isWatching = true;
+  watchReserveBtnEl.style.display     = 'none';
+  stopWatchReserveBtnEl.style.display = 'block';
+  setStatus('👁️ 監聽預約按鈕中...解鎖後自動點擊', 'watching');
+  appendLog('▶ 開始監聽預約按鈕', 'success');
+});
+
+stopWatchReserveBtnEl.addEventListener('click', async () => {
+  await sendToWatchTab({ action: 'STOP_WATCH' });
+  isWatching = false;
+  watchReserveBtnEl.style.display     = 'block';
+  stopWatchReserveBtnEl.style.display = 'none';
+  setStatus('💤 尚未啟動', 'idle');
+  appendLog('⏸ 已停止監聽');
+});
 
 // ─── 區域 Tag 管理 ─────────────────────────────────────────
 function addZone(code) {
@@ -132,6 +172,11 @@ async function getNolTab() {
   return tabs[0] || null;
 }
 
+async function getWatchTab() {
+  const tabs = await chrome.tabs.query({ url: 'https://tickets.interpark.com/*' });
+  return tabs[0] || null;
+}
+
 async function ensureContentScript(tabId) {
   // 確認兩支腳本都已載入
   try {
@@ -241,6 +286,15 @@ chrome.runtime.onMessage.addListener((msg) => {
     // 更新嘗試次數
     const match = msg.message.match(/第 (\d+) 次/);
     if (match) attemptEl.textContent = match[1];
+  }
+
+  if (msg.action === 'RESERVE_BTN_CLICKED') {
+    isWatching = false;
+    watchReserveBtnEl.style.display     = 'block';
+    stopWatchReserveBtnEl.style.display = 'none';
+    setStatus('✅ 預約按鈕已點擊！進入下一步...', 'found');
+    appendLog('🚀 預約按鈕解鎖並已點擊！', 'found');
+    playFoundBeep();
   }
 
   if (msg.action === 'SEAT_FOUND') {

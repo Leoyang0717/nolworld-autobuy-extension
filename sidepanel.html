@@ -166,6 +166,21 @@
     }
     .btn-stop:hover { background: #616161; }
 
+    .btn-watch {
+      background: #1976d2;
+      color: white;
+    }
+    .btn-watch:hover { background: #1565c0; }
+
+    .btn-watch-stop {
+      background: #757575;
+      color: white;
+      display: none;
+    }
+    .btn-watch-stop:hover { background: #616161; }
+
+    .status-watching { background: #e3f2fd; color: #0d47a1; border-left: 3px solid #1976d2; }
+
     /* 狀態顯示 */
     .status-box {
       padding: 10px 12px;
@@ -222,6 +237,14 @@
     <h1>🍇 NOL World 搶票助手</h1>
     <div class="subtitle">自動區域輪詢 · 綠葡萄偵測 · 自動點擊</div>
     <div class="version" id="versionLabel"></div>
+  </div>
+
+  <!-- 預約按鈕監聽 -->
+  <div class="section">
+    <div class="section-title">⏰ 預約搶先點擊</div>
+    <div class="hint" style="margin-bottom:10px;">在預約頁面開售前啟動，按鈕解鎖瞬間自動點擊</div>
+    <button class="btn btn-watch" id="watchReserveBtn">👁️ 開始監聽預約按鈕</button>
+    <button class="btn btn-watch-stop" id="stopWatchReserveBtn">⏸️ 停止監聽</button>
   </div>
 
   <!-- 目標區域 -->

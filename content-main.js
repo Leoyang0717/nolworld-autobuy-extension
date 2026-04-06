@@ -15,6 +15,9 @@ let zoneIndex = 0;
 let timer = null;
 let startTime = null;
 
+let watchTimer = null;
+let watchObserver = null;
+
 // ─── 工具 ────────────────────────────────────────────────
 function log(msg) {
   const time = new Date().toLocaleTimeString('zh-TW', { hour12: false });
@@ -25,6 +28,54 @@ function log(msg) {
 
 function randomInterval() {
   return (config.intervalMin || 800) + Math.random() * ((config.intervalMax || 1500) - (config.intervalMin || 800));
+}
+
+// ─── 監聽預約按鈕（gates 頁面）────────────────────────────
+function findReserveBtn(enabledOnly = false) {
+  const selector = enabledOnly ? 'button:not([disabled])' : 'button[disabled]';
+  for (const btn of document.querySelectorAll(selector)) {
+    if ([...btn.classList].some(c => c.includes('primary'))) return btn;
+  }
+  // 備案：頁面上唯一的 disabled/enabled button
+  return enabledOnly ? null : document.querySelector('button[disabled]');
+}
+
+function stopWatchReserveBtn() {
+  if (watchObserver) { watchObserver.disconnect(); watchObserver = null; }
+  if (watchTimer)    { clearInterval(watchTimer);  watchTimer = null; }
+}
+
+function watchReserveBtn() {
+  stopWatchReserveBtn(); // 防止重複啟動
+
+  const disabledBtn = findReserveBtn(false);
+  if (!disabledBtn) {
+    log('⚠️ 找不到預約按鈕（請確認在預約頁面）');
+    return;
+  }
+  log(`🕐 監聽中: "${disabledBtn.textContent.trim()}"，解鎖後立即點擊`);
+
+  function triggerClick(btn) {
+    stopWatchReserveBtn();
+    log('🚀 預約按鈕解鎖！連點 3 次確保觸發！');
+    btn.click();
+    setTimeout(() => btn.click(), 80);
+    setTimeout(() => btn.click(), 160);
+    window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'RESERVE_BTN_CLICKED' } }, '*');
+  }
+
+  // MutationObserver：最快路徑，直接監聽 disabled 屬性
+  watchObserver = new MutationObserver(() => {
+    if (!disabledBtn.disabled) triggerClick(disabledBtn);
+  });
+  watchObserver.observe(disabledBtn, { attributes: true, attributeFilter: ['disabled'] });
+
+  // 備案 polling 每 50ms（應對 React re-render 替換整個按鈕元素的情況）
+  watchTimer = setInterval(() => {
+    if (disabledBtn && !disabledBtn.disabled) { triggerClick(disabledBtn); return; }
+    const fresh = findReserveBtn(true);
+    if (fresh) triggerClick(fresh);
+  }, 50);
 }
 
 // ─── 遞迴搜尋所有 iframe（含巢狀）找 fnBlockSeatUpdate ──
@@ -407,6 +458,8 @@ window.__nolMsgHandler = (e) => {
   else if (msg.action === 'START') { start(msg.config); payload = { ok: true }; }
   else if (msg.action === 'STOP')  { stop('MANUAL');    payload = { ok: true }; }
   else if (msg.action === 'STATUS') payload = { isRunning, zoneIndex, elapsed: startTime ? Date.now() - startTime : 0 };
+  else if (msg.action === 'WATCH_RESERVE') { watchReserveBtn();     payload = { ok: true }; }
+  else if (msg.action === 'STOP_WATCH')   { stopWatchReserveBtn(); payload = { ok: true }; }
 
   window.postMessage({ [MSG_KEY]: true, dir: 'response', action: msg.action, payload }, '*');
 };
