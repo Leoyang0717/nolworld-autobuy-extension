@@ -57,6 +57,30 @@ stopWatchReserveBtnEl.addEventListener('click', async () => {
   appendLog('⏸ 已停止監聽');
 });
 
+// ─── 座位圖監聽（React SVG 架構）──────────────────────────
+const watchSeatMapBtnEl     = document.getElementById('watchSeatMapBtn');
+const stopWatchSeatMapBtnEl = document.getElementById('stopWatchSeatMapBtn');
+
+watchSeatMapBtnEl.addEventListener('click', async () => {
+  const rowsRaw = document.getElementById('seatRowInput').value.trim();
+  const rows = rowsRaw ? rowsRaw.split(/[,，\s]+/).filter(Boolean) : [];
+  const res = await sendToWatchTab({ action: 'WATCH_SEATMAP', rows });
+  if (!res?.ok) return;
+  watchSeatMapBtnEl.style.display     = 'none';
+  stopWatchSeatMapBtnEl.style.display = 'block';
+  const desc = rows.length ? `row: [${rows.join(', ')}]` : '全場';
+  setStatus(`👁️ 監聽座位圖中（${desc}）...`, 'watching');
+  appendLog(`▶ 開始監聽座位圖（${desc}）`, 'success');
+});
+
+stopWatchSeatMapBtnEl.addEventListener('click', async () => {
+  await sendToWatchTab({ action: 'STOP_WATCH_SEATMAP' });
+  watchSeatMapBtnEl.style.display     = 'block';
+  stopWatchSeatMapBtnEl.style.display = 'none';
+  setStatus('💤 尚未啟動', 'idle');
+  appendLog('⏸ 已停止座位圖監聽');
+});
+
 // ─── 區域 Tag 管理 ─────────────────────────────────────────
 function addZone(code) {
   code = code.trim().replace(/[,，]/g, '');
@@ -295,6 +319,21 @@ chrome.runtime.onMessage.addListener((msg) => {
     setStatus('✅ 預約按鈕已點擊！進入下一步...', 'found');
     appendLog('🚀 預約按鈕解鎖並已點擊！', 'found');
     playFoundBeep();
+  }
+
+  if (msg.action === 'SEATMAP_FOUND') {
+    watchSeatMapBtnEl.style.display     = 'block';
+    stopWatchSeatMapBtnEl.style.display = 'none';
+    setStatus('✅ 座位已自動選取並送出！請確認頁面', 'found');
+    appendLog(`🎯 座位已點擊：${msg.id}`, 'found');
+    playFoundBeep();
+    chrome.notifications.create({
+      type: 'basic',
+      iconUrl: 'icons/icon128.png',
+      title: 'NOL World 座位搶到了！',
+      message: `已自動點擊座位 ${msg.id} 並送出 Submit！`,
+      priority: 2,
+    });
   }
 
   if (msg.action === 'SEAT_FOUND') {

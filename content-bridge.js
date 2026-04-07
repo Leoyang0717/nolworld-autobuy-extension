@@ -10,7 +10,7 @@ const MSG_KEY = '__nol__';
 
 // sidepanel → MAIN world
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (!['START', 'STOP', 'STATUS', 'PING', 'WATCH_RESERVE', 'STOP_WATCH'].includes(msg.action)) return;
+  if (!['START', 'STOP', 'STATUS', 'PING', 'WATCH_RESERVE', 'STOP_WATCH', 'WATCH_SEATMAP', 'STOP_WATCH_SEATMAP'].includes(msg.action)) return;
 
   window.postMessage({ [MSG_KEY]: true, dir: 'to-main', msg }, '*');
 

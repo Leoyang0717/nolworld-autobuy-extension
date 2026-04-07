@@ -18,6 +18,46 @@ let startTime = null;
 let watchTimer = null;
 let watchObserver = null;
 
+let seatMapObserver = null;
+let seatMapTriggered = false;
+let seatMapHeartbeat = null;
+const rejectedSeats = new Set(); // 被伺服器 reject 的座位，暫時跳過
+let selectApiCalled = false;
+let origFetch = null;
+let origXhrOpen = null;
+
+function hookFetch() {
+  // Fetch API
+  if (!origFetch) {
+    origFetch = window.fetch;
+    window.fetch = async function(...args) {
+      const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
+      if (url.includes('/api/seats/select')) {
+        selectApiCalled = true;
+        log(`[API] seats/select (fetch) 已發出`);
+      }
+      return origFetch.apply(this, args);
+    };
+  }
+  // XMLHttpRequest（站台實際使用 XHR）
+  if (!origXhrOpen) {
+    origXhrOpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+      if (typeof url === 'string' && url.includes('/api/seats/select')) {
+        selectApiCalled = true;
+        log(`[API] seats/select (XHR) 已發出`);
+      }
+      return origXhrOpen.apply(this, [method, url, ...rest]);
+    };
+  }
+}
+
+function unhookFetch() {
+  if (origFetch)    { window.fetch = origFetch; origFetch = null; }
+  if (origXhrOpen)  { XMLHttpRequest.prototype.open = origXhrOpen; origXhrOpen = null; }
+  selectApiCalled = false;
+}
+
 // ─── 工具 ────────────────────────────────────────────────
 function log(msg) {
   const time = new Date().toLocaleTimeString('zh-TW', { hour12: false });
@@ -76,6 +116,212 @@ function watchReserveBtn() {
     const fresh = findReserveBtn(true);
     if (fresh) triggerClick(fresh);
   }, 50);
+}
+
+// ─── 座位圖監聽（React SVG 架構）──────────────────────────
+function stopWatchSeatMap() {
+  if (seatMapObserver)  { seatMapObserver.disconnect(); seatMapObserver = null; }
+  if (seatMapHeartbeat) { clearInterval(seatMapHeartbeat); seatMapHeartbeat = null; }
+  unhookFetch();
+  // 注意：不在這裡 reset seatMapTriggered
+  // triggerSeat 呼叫時需保持 true 防止重複觸發
+}
+
+function findSubmitBtn() {
+  for (const btn of document.querySelectorAll('button')) {
+    if (btn.textContent.trim() === 'Submit') {
+      return btn.disabled ? null : btn;
+    }
+  }
+  return null;
+}
+
+function logSubmitState() {
+  for (const btn of document.querySelectorAll('button')) {
+    if (btn.textContent.trim() === 'Submit') {
+      log(`[Submit] disabled=${btn.disabled}`);
+      return;
+    }
+  }
+  log('[Submit] 找不到 Submit 按鈕');
+}
+
+function isSeatAvailable(circle) {
+  if (rejectedSeats.has(circle.id)) return false;
+  const cls = circle.className?.baseVal || circle.getAttribute('class') || '';
+  return cls.includes('js-seat') && !cls.includes('SeatMap_disabled__');
+}
+
+function watchSeatMap(targetRows) {
+  stopWatchSeatMap();
+  seatMapTriggered = false; // 重新開始監聽時才 reset
+
+  // 監聽穩定的高層容器，避免 React re-mount 導致參照失效
+  const observeRoot = document.querySelector('.SeatMap_seatMap__3ktuQ')
+    || document.querySelector('main')
+    || document.body;
+
+  if (!document.querySelector('svg')) {
+    log('⚠️ 找不到 SVG 座位圖（確認在選座頁面）');
+    return;
+  }
+
+  hookFetch();
+  selectApiCalled = false;
+  const desc = targetRows?.length ? `row [${targetRows.join(', ')}]` : '全場';
+  log(`🕐 座位圖監聽中：${desc}`);
+
+  function checkStolenModal(circleId) {
+    // 只要出現 Confirm 按鈕就處理，不管 modal 文字內容
+    const confirmBtn = document.querySelector('.ModalConfirm_button__qDjC3');
+    if (confirmBtn) {
+      const msg = document.getElementById('dialogMessage');
+      const text = msg?.textContent?.trim() || '(未知錯誤)';
+      // React 按鈕需用 __reactProps.onClick，否則 .click() 無效
+      const reactKey = Object.keys(confirmBtn).find(k => k.startsWith('__reactProps'));
+      if (reactKey && confirmBtn[reactKey]?.onClick) {
+        confirmBtn[reactKey].onClick({ type: 'click', target: confirmBtn, currentTarget: confirmBtn, bubbles: true, cancelable: true, preventDefault: () => {}, stopPropagation: () => {} });
+      } else {
+        confirmBtn.click();
+      }
+      rejectedSeats.add(circleId);
+      log(`⚠️ Modal：「${text}」，加入黑名單，重新監聽...`);
+      setTimeout(() => { rejectedSeats.delete(circleId); }, 3000);
+      setTimeout(() => watchSeatMap(targetRows), 500);
+      return true;
+    }
+    return false;
+  }
+
+  function triggerSeat(circle) {
+    if (seatMapTriggered) return;
+    seatMapTriggered = true;
+    stopWatchSeatMap(); // 斷開 observer，但也會 unhookFetch
+    selectApiCalled = false;
+    hookFetch();        // 重新掛，用於偵測 select API 發出後停止 Submit 循環
+    log(`🚀 [1] 座位解鎖：${circle.id}`);
+
+    // 步驟1：點擊座位
+    const circleReactKey = Object.keys(circle).find(k => k.startsWith('__reactProps'));
+    if (circleReactKey && circle[circleReactKey]?.onClick) {
+      circle[circleReactKey].onClick({ type: 'click', target: circle, currentTarget: circle, bubbles: true });
+      log('[2] 座位：React handler 觸發');
+    } else {
+      const opts = { bubbles: true, cancelable: true, isPrimary: true };
+      circle.dispatchEvent(new PointerEvent('pointerover', opts));
+      circle.dispatchEvent(new PointerEvent('pointerenter', opts));
+      circle.dispatchEvent(new PointerEvent('pointerdown', opts));
+      circle.dispatchEvent(new PointerEvent('pointerup', opts));
+      circle.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      log('[2] 座位：dispatchEvent 觸發');
+    }
+
+    // 步驟2：等 Submit 解鎖
+    let attempts = 0;
+    const t = setInterval(() => {
+      if (checkStolenModal(circle.id)) { clearInterval(t); return; }
+      const btn = findSubmitBtn();
+      if (btn) {
+        clearInterval(t);
+        log(`[3] Submit 解鎖（等了 ${attempts * 100}ms），開始反覆按直到成功...`);
+        window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'SEATMAP_FOUND', id: circle.id } }, '*');
+
+        function clickSubmit(b) {
+          const reactKey = Object.keys(b).find(k => k.startsWith('__reactProps'));
+          if (reactKey && b[reactKey]?.onClick) {
+            const fakeEv = {
+              type: 'click', target: b, currentTarget: b,
+              bubbles: true, cancelable: true, defaultPrevented: false,
+              preventDefault: () => {}, stopPropagation: () => {},
+              stopImmediatePropagation: () => {}, nativeEvent: new MouseEvent('click', { bubbles: true }),
+            };
+            b[reactKey].onClick(fakeEv);
+            log('[4] Submit 按下（React handler）');
+          } else {
+            b.click();
+            log('[4] Submit 按下（fallback）');
+          }
+        }
+
+        // 每 200ms 按一次，直到 PriceContent 出現（成功）或逾時
+        let submitCount = 0;
+        const t2 = setInterval(() => {
+          if (checkStolenModal(circle.id)) { clearInterval(t2); return; }
+          if ([...document.querySelectorAll('h2')].some(h => h.textContent.trim() === 'Select Price')) {
+            clearInterval(t2);
+            log('✅ Select Price 已出現，Submit 成功！');
+            return;
+          }
+          const freshBtn = findSubmitBtn();
+          // select API 已發出 → 停止按，等結果
+          if (selectApiCalled) {
+            clearInterval(t2);
+            log('[4] select API 已發出，等待結果...');
+            return;
+          }
+          if (freshBtn) {
+            log(`[4] Submit #${submitCount + 1}：disabled=${freshBtn.disabled} parent="${freshBtn.parentElement?.className}"`);
+            clickSubmit(freshBtn);
+          } else {
+            clearInterval(t2);
+            log('⚠️ Submit 按鈕消失，重新監聽...');
+            setTimeout(() => watchSeatMap(targetRows), 500);
+            return;
+          }
+          if (++submitCount > 20) {
+            clearInterval(t2);
+            log('⚠️ Submit 反覆按仍未發出 select API，重新監聽...');
+            setTimeout(() => watchSeatMap(targetRows), 500);
+          }
+        }, 150);
+      } else if (++attempts > 60) {
+        clearInterval(t);
+        logSubmitState();
+        log('[3] ⚠️ Submit 等待逾時（3s），請手動點擊');
+      }
+    }, 100);
+  }
+
+  // 每次都重新查詢 DOM，不依賴舊參照
+  function scanTargets() {
+    if (seatMapTriggered) return;
+    const elements = targetRows?.length
+      ? targetRows.map(r => document.getElementById(`seat_block_${r}`)).filter(Boolean)
+      : [document.querySelector('svg')].filter(Boolean);
+
+    for (const el of elements) {
+      for (const circle of el.querySelectorAll('circle.js-seat')) {
+        if (isSeatAvailable(circle)) { triggerSeat(circle); return; }
+      }
+    }
+  }
+
+  // 先掃描現有可用座位
+  scanTargets();
+  if (seatMapTriggered) return;
+
+  // 每 30 秒 heartbeat
+  let heartbeatCount = 0;
+  seatMapHeartbeat = setInterval(() => {
+    heartbeatCount++;
+    log(`👁️ 座位圖監聽中（${heartbeatCount * 30}s）...等待位置解鎖`);
+  }, 30000);
+
+  // 監聽高層容器，捕捉任何 DOM 變化（attribute 修改 or React 整體替換）
+  let mutationCount = 0;
+  seatMapObserver = new MutationObserver(() => {
+    if (seatMapTriggered) return;
+    mutationCount++;
+    log(`[DOM] 變化 #${mutationCount}，掃描中...`);
+    scanTargets();
+  });
+
+  seatMapObserver.observe(observeRoot, {
+    subtree: true,
+    attributes: true,
+    attributeFilter: ['class', 'fill'],
+    childList: true,
+  });
 }
 
 // ─── 遞迴搜尋所有 iframe（含巢狀）找 fnBlockSeatUpdate ──
@@ -458,8 +704,10 @@ window.__nolMsgHandler = (e) => {
   else if (msg.action === 'START') { start(msg.config); payload = { ok: true }; }
   else if (msg.action === 'STOP')  { stop('MANUAL');    payload = { ok: true }; }
   else if (msg.action === 'STATUS') payload = { isRunning, zoneIndex, elapsed: startTime ? Date.now() - startTime : 0 };
-  else if (msg.action === 'WATCH_RESERVE') { watchReserveBtn();     payload = { ok: true }; }
-  else if (msg.action === 'STOP_WATCH')   { stopWatchReserveBtn(); payload = { ok: true }; }
+  else if (msg.action === 'WATCH_RESERVE')   { watchReserveBtn();           payload = { ok: true }; }
+  else if (msg.action === 'STOP_WATCH')      { stopWatchReserveBtn();       payload = { ok: true }; }
+  else if (msg.action === 'WATCH_SEATMAP')   { watchSeatMap(msg.rows || []); payload = { ok: true }; }
+  else if (msg.action === 'STOP_WATCH_SEATMAP') { stopWatchSeatMap();       payload = { ok: true }; }
 
   window.postMessage({ [MSG_KEY]: true, dir: 'response', action: msg.action, payload }, '*');
 };
