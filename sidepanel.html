@@ -255,6 +255,11 @@
       <input type="text" id="seatRowInput" placeholder="例如：003:009, 003:010（留空=全場）">
       <div class="hint">💡 開售後座位由灰轉紫/綠時立即點擊並按 Submit</div>
     </div>
+    <div class="form-group">
+      <label>監聽時限（分鐘，0=無限）</label>
+      <input type="number" id="seatMapTimeout" min="0" max="60" value="10" style="width:80px;">
+      <div class="hint">⏱️ 超過時限自動停止監聽並提醒，需重新進入頁面</div>
+    </div>
     <button class="btn btn-watch" id="watchSeatMapBtn">👁️ 開始監聽座位圖</button>
     <button class="btn btn-watch-stop" id="stopWatchSeatMapBtn">⏸️ 停止監聽</button>
   </div>

@@ -64,7 +64,8 @@ const stopWatchSeatMapBtnEl = document.getElementById('stopWatchSeatMapBtn');
 watchSeatMapBtnEl.addEventListener('click', async () => {
   const rowsRaw = document.getElementById('seatRowInput').value.trim();
   const rows = rowsRaw ? rowsRaw.split(/[,，\s]+/).filter(Boolean) : [];
-  const res = await sendToWatchTab({ action: 'WATCH_SEATMAP', rows });
+  const timeoutMin = parseInt(document.getElementById('seatMapTimeout').value) || 0;
+  const res = await sendToWatchTab({ action: 'WATCH_SEATMAP', rows, timeoutMin });
   if (!res?.ok) return;
   watchSeatMapBtnEl.style.display     = 'none';
   stopWatchSeatMapBtnEl.style.display = 'block';
@@ -137,18 +138,20 @@ function saveSettings() {
     nolIntervalMin: parseInt(document.getElementById('intervalMin').value),
     nolIntervalMax: parseInt(document.getElementById('intervalMax').value),
     nolDuration:    parseInt(document.getElementById('duration').value),
+    nolSeatMapTimeout: parseInt(document.getElementById('seatMapTimeout').value) || 0,
   });
 }
 
 async function loadSettings() {
-  const s = await chrome.storage.local.get(['nolZones', 'nolIntervalMin', 'nolIntervalMax', 'nolDuration']);
+  const s = await chrome.storage.local.get(['nolZones', 'nolIntervalMin', 'nolIntervalMax', 'nolDuration', 'nolSeatMapTimeout']);
   if (s.nolZones) { zones = s.nolZones; renderZones(); }
   if (s.nolIntervalMin) document.getElementById('intervalMin').value = s.nolIntervalMin;
   if (s.nolIntervalMax) document.getElementById('intervalMax').value = s.nolIntervalMax;
   if (s.nolDuration)    document.getElementById('duration').value    = s.nolDuration;
+  if (s.nolSeatMapTimeout !== undefined) document.getElementById('seatMapTimeout').value = s.nolSeatMapTimeout;
 }
 
-['intervalMin', 'intervalMax', 'duration'].forEach(id =>
+['intervalMin', 'intervalMax', 'duration', 'seatMapTimeout'].forEach(id =>
   document.getElementById(id).addEventListener('change', saveSettings)
 );
 
@@ -332,6 +335,21 @@ chrome.runtime.onMessage.addListener((msg) => {
       iconUrl: 'icons/icon128.png',
       title: 'NOL World 座位搶到了！',
       message: `已自動點擊座位 ${msg.id} 並送出 Submit！`,
+      priority: 2,
+    });
+  }
+
+  if (msg.action === 'SEATMAP_TIMEOUT') {
+    watchSeatMapBtnEl.style.display     = 'block';
+    stopWatchSeatMapBtnEl.style.display = 'none';
+    setStatus(`⏱️ 座位圖監聽已逾時（${msg.minutes}分鐘）`, 'error');
+    appendLog(`⏱️ 監聽已達 ${msg.minutes} 分鐘時限，已自動停止。請重新進入頁面再監聽`, 'error');
+    playWarningBeep();
+    chrome.notifications.create({
+      type: 'basic',
+      iconUrl: 'icons/icon128.png',
+      title: '⏱️ 座位圖監聽逾時！',
+      message: `已監聽 ${msg.minutes} 分鐘，頁面可能已失效。請重新進入頁面後再啟動監聽。`,
       priority: 2,
     });
   }

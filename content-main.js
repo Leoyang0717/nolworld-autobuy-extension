@@ -152,7 +152,7 @@ function isSeatAvailable(circle) {
   return cls.includes('js-seat') && !cls.includes('SeatMap_disabled__');
 }
 
-function watchSeatMap(targetRows) {
+function watchSeatMap(targetRows, timeoutMin = 0) {
   stopWatchSeatMap();
   seatMapTriggered = false; // 重新開始監聽時才 reset
 
@@ -300,11 +300,22 @@ function watchSeatMap(targetRows) {
   scanTargets();
   if (seatMapTriggered) return;
 
-  // 每 30 秒 heartbeat
+  // 每 30 秒 heartbeat + 逾時檢查
   let heartbeatCount = 0;
+  const timeoutSec = timeoutMin * 60;
+  if (timeoutMin > 0) {
+    log(`⏱️ 監聽時限：${timeoutMin} 分鐘（${timeoutSec}s）`);
+  }
   seatMapHeartbeat = setInterval(() => {
     heartbeatCount++;
-    log(`👁️ 座位圖監聽中（${heartbeatCount * 30}s）...等待位置解鎖`);
+    const elapsed = heartbeatCount * 30;
+    if (timeoutSec > 0 && elapsed >= timeoutSec) {
+      log(`⏱️ 監聽已達 ${timeoutMin} 分鐘時限，自動停止`);
+      stopWatchSeatMap();
+      window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'SEATMAP_TIMEOUT', minutes: timeoutMin } }, '*');
+      return;
+    }
+    log(`👁️ 座位圖監聽中（${elapsed}s）...等待位置解鎖`);
   }, 30000);
 
   // 監聽高層容器，捕捉任何 DOM 變化（attribute 修改 or React 整體替換）
@@ -706,7 +717,7 @@ window.__nolMsgHandler = (e) => {
   else if (msg.action === 'STATUS') payload = { isRunning, zoneIndex, elapsed: startTime ? Date.now() - startTime : 0 };
   else if (msg.action === 'WATCH_RESERVE')   { watchReserveBtn();           payload = { ok: true }; }
   else if (msg.action === 'STOP_WATCH')      { stopWatchReserveBtn();       payload = { ok: true }; }
-  else if (msg.action === 'WATCH_SEATMAP')   { watchSeatMap(msg.rows || []); payload = { ok: true }; }
+  else if (msg.action === 'WATCH_SEATMAP')   { watchSeatMap(msg.rows || [], msg.timeoutMin || 0); payload = { ok: true }; }
   else if (msg.action === 'STOP_WATCH_SEATMAP') { stopWatchSeatMap();       payload = { ok: true }; }
 
   window.postMessage({ [MSG_KEY]: true, dir: 'response', action: msg.action, payload }, '*');
