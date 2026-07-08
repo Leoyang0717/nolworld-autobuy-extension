@@ -296,6 +296,9 @@ function handleStopped(reason) {
   } else if (reason === 'TIMEOUT') {
     setStatus('⏱️ 時間到，已停止', 'idle');
     appendLog('⏱ 達到設定時間，已停止');
+  } else if (reason === 'ACCESS_DENIED') {
+    setStatus('⛔ Access Denied 連續 3 次等待無效，已停止。建議等下一輪排隊再刷', 'error');
+    appendLog('⛔ 11 秒等待策略連續失效，已停止搶票', 'error');
   } else {
     setStatus('💤 已停止', 'idle');
     appendLog('⏸ 已手動停止');
@@ -366,6 +369,36 @@ chrome.runtime.onMessage.addListener((msg) => {
     });
   }
 
+  if (msg.action === 'ACCESS_DENIED') {
+    // 暫停不是停止：不呼叫 handleStopped，碼表照跑、停止按鈕仍可用
+    setStatus(`⛔ Access Denied（連續第 ${msg.count} 次），暫停 11 秒後自動繼續`, 'error');
+    appendLog(`⛔ 遇到 Access Denied（連續第 ${msg.count} 次），暫停 11 秒`, 'error');
+    playAccessDeniedBeep();
+    chrome.notifications.create({
+      type: 'basic',
+      iconUrl: 'icons/icon128.png',
+      title: '⛔ Access Denied！',
+      message: `刷太快被暫時擋下（連續第 ${msg.count} 次），已暫停 11 秒，之後自動繼續刷票`,
+      priority: 2,
+    });
+  }
+
+  if (msg.action === 'ACCESS_DENIED_RESUMED') {
+    setStatus(`🔄 刷票中... 區域: [${zones.join(', ')}]`, 'running');
+    appendLog('⏳ 等待結束，已恢復刷票', 'success');
+  }
+
+  if (msg.action === 'ACCESS_DENIED_FATAL') {
+    playFatalAlarmBeep();
+    chrome.notifications.create({
+      type: 'basic',
+      iconUrl: 'icons/icon128.png',
+      title: '🚨 Access Denied 連續封鎖，已停止！',
+      message: '等 11 秒重試連續 3 次都失敗，封鎖可能已升級。建議等下一輪排隊再刷，不要立刻硬碰',
+      priority: 2,
+    });
+  }
+
   if (msg.action === 'CAPTCHA') {
     handleStopped('CAPTCHA');
     playWarningBeep();
@@ -429,6 +462,51 @@ function playWarningBeep() {
       osc.start(ctx.currentTime + start);
       osc.stop(ctx.currentTime + start + 0.35);
     });
+  } catch (e) {
+    console.warn('無法播放提示音:', e);
+  }
+}
+
+// Access Denied 暫停：四聲高低交替方波（嗶-啵-嗶-啵，機械警報感）
+// 音色（方波）和節奏都與上面兩種 sine 音效不同，可閉眼辨識
+function playAccessDeniedBeep() {
+  try {
+    const ctx = new AudioContext();
+    [660, 520, 660, 520].forEach((freq, i) => {
+      const startAt = i * 0.18;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.type = 'square';
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.25, ctx.currentTime + startAt);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + startAt + 0.15);
+      osc.start(ctx.currentTime + startAt);
+      osc.stop(ctx.currentTime + startAt + 0.15);
+    });
+  } catch (e) {
+    console.warn('無法播放提示音:', e);
+  }
+}
+
+// 連續封鎖停止：六聲急促高低警笛（鋸齒波，最強烈的警報）
+function playFatalAlarmBeep() {
+  try {
+    const ctx = new AudioContext();
+    for (let i = 0; i < 6; i++) {
+      const startAt = i * 0.25;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.type = 'sawtooth';
+      osc.frequency.value = i % 2 === 0 ? 988 : 660;
+      gain.gain.setValueAtTime(0.35, ctx.currentTime + startAt);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + startAt + 0.22);
+      osc.start(ctx.currentTime + startAt);
+      osc.stop(ctx.currentTime + startAt + 0.22);
+    }
   } catch (e) {
     console.warn('無法播放提示音:', e);
   }

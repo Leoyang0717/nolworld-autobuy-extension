@@ -14,6 +14,7 @@ let config = null;
 let zoneIndex = 0;
 let timer = null;
 let startTime = null;
+let deniedStreak = 0; // 連續偵測到 Access Denied 的次數（看到正常座位圖即歸零）
 
 let watchTimer = null;
 let watchObserver = null;
@@ -406,6 +407,22 @@ function clickZone(zoneCode) {
   return false;
 }
 
+// ─── Access Denied 偵測 ──────────────────────────────────
+// 刷太快被 WAF 擋下時，座位 iframe 會變成 Access Denied 頁面
+function findAccessDeniedInDoc(doc, depth) {
+  if (!doc || depth > 5) return false;
+  try {
+    const text = doc.body?.innerText || '';
+    if (text.includes('Access Denied')) return true;
+    for (const iframe of doc.querySelectorAll('iframe')) {
+      try {
+        if (findAccessDeniedInDoc(iframe.contentDocument, depth + 1)) return true;
+      } catch (_) {}
+    }
+  } catch (_) {}
+  return false;
+}
+
 // ─── 驗證碼偵測 ──────────────────────────────────────────
 function findCaptchaInDoc(doc, depth) {
   if (depth > 5) return false;
@@ -652,6 +669,30 @@ async function runCycle() {
 
   if (clicked) {
     await waitForSeatLoad();
+
+    // 檢查點擊後載入的畫面是否為 Access Denied
+    // 必須放在載入完成後檢查：Denied 頁面會殘留在 iframe 內，
+    // 若在點擊前檢查會把殘留的舊畫面誤計成新的一次
+    if (findAccessDeniedInDoc(document, 0)) {
+      deniedStreak++;
+      if (deniedStreak >= 4) {
+        log(`⛔ Access Denied 連續 ${deniedStreak - 1} 次等待後仍被擋，11 秒策略已失效，停止搶票`);
+        window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'ACCESS_DENIED_FATAL', count: deniedStreak } }, '*');
+        stop('ACCESS_DENIED');
+        return;
+      }
+      log(`⛔ 偵測到 Access Denied（連續第 ${deniedStreak} 次），暫停 11 秒後自動繼續（持續時間照常計算）`);
+      window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'ACCESS_DENIED', count: deniedStreak } }, '*');
+      timer = setTimeout(() => {
+        log('⏳ 等待 11 秒結束，恢復刷票...');
+        window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'ACCESS_DENIED_RESUMED' } }, '*');
+        runCycle();
+      }, 11000);
+      return;
+    }
+    // 正常看到座位圖 → 連續計數歸零
+    deniedStreak = 0;
+
     const seat = findAvailableSeat();
     if (seat) {
       log(`✅ 找到綠葡萄！區域 ${zoneCode}，點擊座位中...`);
@@ -683,6 +724,7 @@ function start(cfg) {
   config = cfg;
   isRunning = true;
   zoneIndex = 0;
+  deniedStreak = 0;
   startTime = Date.now();
   log(`開始搶票！區域: [${cfg.zones.join(', ')}]，間隔: ${cfg.intervalMin}~${cfg.intervalMax}ms，持續: ${cfg.durationMs / 60000} 分鐘`);
   runCycle();
