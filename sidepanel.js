@@ -131,6 +131,23 @@ zoneInput.addEventListener('blur', () => {
   }
 });
 
+// ─── 模式切換（偵察 / 盲輪）────────────────────────────────
+const modeScoutEl   = document.getElementById('modeScout');
+const modeBlindEl   = document.getElementById('modeBlind');
+const scoutFieldsEl = document.getElementById('scoutFields');
+const blindFieldsEl = document.getElementById('blindFields');
+
+function applyModeDisplay() {
+  const scout = modeScoutEl.checked;
+  scoutFieldsEl.style.display = scout ? 'block' : 'none';
+  blindFieldsEl.style.display = scout ? 'none'  : 'block';
+}
+
+[modeScoutEl, modeBlindEl].forEach(el => el.addEventListener('change', () => {
+  applyModeDisplay();
+  saveSettings();
+}));
+
 // ─── 設定存取 ──────────────────────────────────────────────
 function saveSettings() {
   chrome.storage.local.set({
@@ -139,19 +156,24 @@ function saveSettings() {
     nolIntervalMax: parseInt(document.getElementById('intervalMax').value),
     nolDuration:    parseInt(document.getElementById('duration').value),
     nolSeatMapTimeout: parseInt(document.getElementById('seatMapTimeout').value) || 0,
+    nolScoutMode:  modeScoutEl.checked,
+    nolScoutReqMs: parseInt(document.getElementById('scoutInterval').value) || 800,
   });
 }
 
 async function loadSettings() {
-  const s = await chrome.storage.local.get(['nolZones', 'nolIntervalMin', 'nolIntervalMax', 'nolDuration', 'nolSeatMapTimeout']);
+  const s = await chrome.storage.local.get(['nolZones', 'nolIntervalMin', 'nolIntervalMax', 'nolDuration', 'nolSeatMapTimeout', 'nolScoutMode', 'nolScoutReqMs']);
   if (s.nolZones) { zones = s.nolZones; renderZones(); }
   if (s.nolIntervalMin) document.getElementById('intervalMin').value = s.nolIntervalMin;
   if (s.nolIntervalMax) document.getElementById('intervalMax').value = s.nolIntervalMax;
   if (s.nolDuration)    document.getElementById('duration').value    = s.nolDuration;
   if (s.nolSeatMapTimeout !== undefined) document.getElementById('seatMapTimeout').value = s.nolSeatMapTimeout;
+  if (s.nolScoutMode === false) { modeBlindEl.checked = true; modeScoutEl.checked = false; }
+  if (s.nolScoutReqMs) document.getElementById('scoutInterval').value = s.nolScoutReqMs;
+  applyModeDisplay();
 }
 
-['intervalMin', 'intervalMax', 'duration', 'seatMapTimeout'].forEach(id =>
+['intervalMin', 'intervalMax', 'duration', 'seatMapTimeout', 'scoutInterval'].forEach(id =>
   document.getElementById(id).addEventListener('change', saveSettings)
 );
 
@@ -258,11 +280,14 @@ startBtn.addEventListener('click', async () => {
     return;
   }
 
+  const scoutMode = document.getElementById('modeScout').checked;
   const config = {
     zones,
     intervalMin:  parseInt(document.getElementById('intervalMin').value) || 800,
     intervalMax:  parseInt(document.getElementById('intervalMax').value) || 1500,
     durationMs:   (parseInt(document.getElementById('duration').value) || 9) * 60 * 1000,
+    scoutMode,
+    scoutIntervalMs: parseInt(document.getElementById('scoutInterval').value) || 800,
   };
 
   const res = await sendToContent({ action: 'START', config, _ts: Date.now() });
@@ -271,9 +296,13 @@ startBtn.addEventListener('click', async () => {
   isRunning = true;
   startBtn.style.display = 'none';
   stopBtn.style.display  = 'block';
-  setStatus(`🔄 刷票中... 區域: [${zones.join(', ')}]`, 'running');
+  if (scoutMode) {
+    setStatus(`🛰️ 偵察中... 掃描 ${zones.length} 區`, 'running');
+  } else {
+    setStatus(`🔄 刷票中... 區域: [${zones.join(', ')}]`, 'running');
+  }
   startStatsTimer();
-  appendLog(`▶ 開始搶票，區域: [${zones.join(', ')}]`, 'success');
+  appendLog(`▶ 開始搶票（${scoutMode ? '偵察' : '盲輪'}模式），區域: [${zones.join(', ')}]`, 'success');
 });
 
 stopBtn.addEventListener('click', async () => {
@@ -299,6 +328,9 @@ function handleStopped(reason) {
   } else if (reason === 'ACCESS_DENIED') {
     setStatus('⛔ Access Denied 連續 3 次等待無效，已停止。建議等下一輪排隊再刷', 'error');
     appendLog('⛔ 11 秒等待策略連續失效，已停止搶票', 'error');
+  } else if (reason === 'ANOMALY') {
+    setStatus('⚠️ 偵察回應連續異常，已停止。請檢查頁面（可能出現驗證或 session 失效）', 'error');
+    appendLog('⚠️ 偵察回應連續異常，已停止搶票', 'error');
   } else {
     setStatus('💤 已停止', 'idle');
     appendLog('⏸ 已手動停止');
@@ -313,9 +345,53 @@ chrome.runtime.onMessage.addListener((msg) => {
     const type = isFound ? 'found' : isError ? 'error' : '';
     appendLog(msg.message, type);
 
-    // 更新嘗試次數
+    // 更新嘗試次數（盲輪的「第 N 次」；偵察輪數由 SCOUT_ROUND 更新）
     const match = msg.message.match(/第 (\d+) 次/);
     if (match) attemptEl.textContent = match[1];
+  }
+
+  if (msg.action === 'SCOUT_ROUND') {
+    attemptEl.textContent = msg.round;
+    if (isRunning) {
+      const normal = msg.normal ?? msg.zones;
+      const total = msg.total ?? msg.zones;
+      setStatus(`🛰️ 偵察中 第 ${msg.round} 輪・已掃 ${msg.zones} 區・${normal}/${total} 正常・無票`, 'running');
+    }
+  }
+
+  if (msg.action === 'CAPTCHA_PAUSE') {
+    // 暫停不是停止：碼表照跑、停止按鈕仍可用
+    setStatus('🔒 需要驗證！請完成畫面上的驗證，完成後自動恢復偵察', 'error');
+    appendLog('🔒 偵測到驗證要求，已暫停偵察並嘗試開啟驗證視窗', 'error');
+    playWarningBeep();
+    chrome.notifications.create({
+      type: 'basic',
+      iconUrl: 'icons/icon128.png',
+      title: '🔒 需要驗證！',
+      message: '已自動開啟驗證視窗，完成驗證後會自動恢復偵察',
+      priority: 2,
+    });
+  }
+
+  if (msg.action === 'CAPTCHA_RESUMED') {
+    setStatus('🛰️ 驗證完成，偵察繼續中...', 'running');
+    appendLog('✅ 驗證完成，偵察已恢復', 'success');
+  }
+
+  if (msg.action === 'SCOUT_FALLBACK') {
+    setStatus('⚠️ 偵察初始化失敗，已改用盲輪模式', 'watching');
+    appendLog('⚠️ 偵察初始化失敗，本輪以盲輪模式執行（詳見上方 log）', 'error');
+  }
+
+  if (msg.action === 'SCOUT_ANOMALY') {
+    playWarningBeep();
+    chrome.notifications.create({
+      type: 'basic',
+      iconUrl: 'icons/icon128.png',
+      title: '⚠️ 偵察回應異常，已停止！',
+      message: '連續 2 輪所有區域回應異常，可能出現驗證或 session 失效，請檢查頁面',
+      priority: 2,
+    });
   }
 
   if (msg.action === 'RESERVE_BTN_CLICKED') {

@@ -15,6 +15,8 @@ let zoneIndex = 0;
 let timer = null;
 let startTime = null;
 let deniedStreak = 0; // 連續偵測到 Access Denied 的次數（看到正常座位圖即歸零）
+let cycleFn = null;    // 當前模式的主循環（runCycle 或 scoutTick）
+let scoutBuildUrl = null; // 偵察網址產生函式 (zone) => url，初始化失敗為 null
 
 let watchTimer = null;
 let watchObserver = null;
@@ -640,7 +642,63 @@ function waitForSeatLoad(timeout = 1500) {
   });
 }
 
-// ─── 主循環 ──────────────────────────────────────────────
+// ─── 驗證碼停止（共用）──────────────────────────────────
+function handleCaptchaStop(where) {
+  log(`🔒 偵測到驗證碼（${where}）！停止搶票，請完成驗證後重新開始`);
+  window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'CAPTCHA' } }, '*');
+  stop('CAPTCHA');
+}
+
+// ─── Access Denied 暫停/停止（盲輪與偵察共用）────────────
+function handleDeniedPause() {
+  deniedStreak++;
+  if (deniedStreak >= 4) {
+    log(`⛔ Access Denied 連續 ${deniedStreak - 1} 次等待後仍被擋，11 秒策略已失效，停止搶票`);
+    window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'ACCESS_DENIED_FATAL', count: deniedStreak } }, '*');
+    stop('ACCESS_DENIED');
+    return;
+  }
+  log(`⛔ 偵測到 Access Denied（連續第 ${deniedStreak} 次），暫停 11 秒後自動繼續（持續時間照常計算）`);
+  window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'ACCESS_DENIED', count: deniedStreak } }, '*');
+  timer = setTimeout(() => {
+    log('⏳ 等待 11 秒結束，恢復刷票...');
+    window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'ACCESS_DENIED_RESUMED' } }, '*');
+    cycleFn();
+  }, 11000);
+}
+
+// ─── 進入區域並嘗試選位（盲輪與偵察共用）─────────────────
+// 回傳 'FOUND' | 'DENIED' | 'CAPTCHA' | 'NONE' | 'FAIL'
+async function enterZoneAndPick(zoneCode) {
+  const clicked = clickZone(zoneCode);
+  if (!clicked) { log(`${zoneCode} 點擊失敗`); return 'FAIL'; }
+
+  await waitForSeatLoad();
+
+  // Denied/驗證碼須在載入完成後檢查：舊畫面會殘留在 iframe 內，
+  // 點擊前檢查會把殘留畫面誤計成新的一次
+  if (findAccessDeniedInDoc(document, 0)) return 'DENIED';
+  if (findCaptchaInDoc(document, 0)) return 'CAPTCHA';
+
+  const seat = findAvailableSeat();
+  if (!seat) { log(`${zoneCode} 無可用座位`); return 'NONE'; }
+
+  log(`✅ 找到綠葡萄！區域 ${zoneCode}，點擊座位中...`);
+  seat.click();
+
+  // 等待座位選取完成，再按確認按鈕（需等伺服器回應）
+  await new Promise(r => setTimeout(r, 150));
+  confirmSeat();
+
+  // 票數頁由 fillTicketCount 自行輪詢等待（最多 5 秒）
+  fillTicketCount();
+
+  window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'SEAT_FOUND', zone: zoneCode } }, '*');
+  stop('FOUND');
+  return 'FOUND';
+}
+
+// ─── 盲輪主循環（逐區輪流點擊）───────────────────────────
 async function runCycle() {
   if (!isRunning) return;
 
@@ -650,13 +708,7 @@ async function runCycle() {
     return;
   }
 
-  // 每輪開始前先偵測是否出現驗證碼
-  if (findCaptchaInDoc(document, 0)) {
-    log('🔒 偵測到驗證碼！停止搶票，請完成驗證後重新開始');
-    window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'CAPTCHA' } }, '*');
-    stop('CAPTCHA');
-    return;
-  }
+  if (findCaptchaInDoc(document, 0)) { handleCaptchaStop('頁面'); return; }
 
   const zones = config.zones;
   if (!zones?.length) { log('未設定任何區域'); stop('NO_ZONES'); return; }
@@ -665,58 +717,240 @@ async function runCycle() {
   zoneIndex++;
 
   log(`嘗試 ${zoneCode} 區域（第 ${zoneIndex} 次）`);
-  const clicked = clickZone(zoneCode);
-
-  if (clicked) {
-    await waitForSeatLoad();
-
-    // 檢查點擊後載入的畫面是否為 Access Denied
-    // 必須放在載入完成後檢查：Denied 頁面會殘留在 iframe 內，
-    // 若在點擊前檢查會把殘留的舊畫面誤計成新的一次
-    if (findAccessDeniedInDoc(document, 0)) {
-      deniedStreak++;
-      if (deniedStreak >= 4) {
-        log(`⛔ Access Denied 連續 ${deniedStreak - 1} 次等待後仍被擋，11 秒策略已失效，停止搶票`);
-        window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'ACCESS_DENIED_FATAL', count: deniedStreak } }, '*');
-        stop('ACCESS_DENIED');
-        return;
-      }
-      log(`⛔ 偵測到 Access Denied（連續第 ${deniedStreak} 次），暫停 11 秒後自動繼續（持續時間照常計算）`);
-      window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'ACCESS_DENIED', count: deniedStreak } }, '*');
-      timer = setTimeout(() => {
-        log('⏳ 等待 11 秒結束，恢復刷票...');
-        window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'ACCESS_DENIED_RESUMED' } }, '*');
-        runCycle();
-      }, 11000);
-      return;
-    }
-    // 正常看到座位圖 → 連續計數歸零
-    deniedStreak = 0;
-
-    const seat = findAvailableSeat();
-    if (seat) {
-      log(`✅ 找到綠葡萄！區域 ${zoneCode}，點擊座位中...`);
-      seat.click();
-
-      // 等待座位選取完成，再按確認按鈕（需等伺服器回應）
-      await new Promise(r => setTimeout(r, 150));
-      confirmSeat();
-
-      // 票數頁由 fillTicketCount 自行輪詢等待（最多 5 秒）
-      fillTicketCount();
-
-      window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'SEAT_FOUND', zone: zoneCode } }, '*');
-      stop('FOUND');
-      return;
-    }
-    log(`${zoneCode} 無可用座位`);
-  } else {
-    log(`${zoneCode} 點擊失敗`);
-  }
+  const res = await enterZoneAndPick(zoneCode);
+  if (res === 'FOUND') return;
+  if (res === 'DENIED')  { handleDeniedPause(); return; }
+  if (res === 'CAPTCHA') { handleCaptchaStop('選位頁'); return; }
+  if (res === 'NONE') deniedStreak = 0; // 正常看到座位圖 → 連續計數歸零
 
   const interval = randomInterval();
   log(`${Math.round(interval)}ms 後試下一個`);
   timer = setTimeout(runCycle, interval);
+}
+
+// ─── 偵察模式：等速滴灌，逐一 fetch 各區座位頁比對文字 ────
+const SCOUT_MAX_INFLIGHT = 2; // 在飛請求上限（實測 3 併發會觸發驗證）
+
+let scoutReqCount = 0;      // 已發出的請求數（輪流換區用）
+let scoutInFlight = 0;      // 目前在飛的請求數
+let scoutBusy = false;      // 開衝/暫停中，此時落地的回應一律丟棄
+let scoutWinNormal = 0;     // 摘要視窗：正常回應數
+let scoutWinTotal = 0;      // 摘要視窗：總回應數
+let scoutConsecAnomaly = 0; // 連續異常回應數（任何正常回應即歸零）
+
+// 遞迴找擁有指定函式的 window（叫出驗證視窗用）
+function findWinWithNamedFn(doc, name, depth) {
+  if (!doc || depth > 5) return null;
+  try {
+    for (const iframe of doc.querySelectorAll('iframe')) {
+      try {
+        const win = iframe.contentWindow;
+        if (typeof win[name] === 'function') return win;
+        const found = findWinWithNamedFn(iframe.contentDocument, name, depth + 1);
+        if (found) return found;
+      } catch (_) {}
+    }
+  } catch (_) {}
+  return null;
+}
+
+// ─── 驗證暫停：自動叫出驗證視窗，解鎖後自動恢復偵察 ───────
+// 伺服器風控標記 session 後，座位頁回應會變成
+// <script>parent.CaptchaOpen('S','seat')</script>；正常流程由頁面執行它彈窗，
+// 我們用 fetch 繞過了頁面，所以要替頁面把驗證視窗叫出來給使用者解
+function pauseForCaptcha(source, responseText) {
+  if (timer) { clearTimeout(timer); timer = null; }
+  scoutBusy = true;
+  log(`🔒 偵測到驗證要求（${source}），暫停偵察（持續時間照常計算）`);
+  window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'CAPTCHA_PAUSE' } }, '*');
+
+  let opened = false;
+  try {
+    const m = responseText ? responseText.match(/CaptchaOpen\(\s*['"]([^'"]*)['"]\s*,\s*['"]([^'"]*)['"]/) : null;
+    let win = null;
+    if (typeof window.CaptchaOpen === 'function') win = window;
+    else win = findWinWithNamedFn(document, 'CaptchaOpen', 0);
+    if (win) {
+      win.CaptchaOpen(m ? m[1] : 'S', m ? m[2] : 'seat');
+      opened = true;
+      log('🔓 已自動開啟驗證視窗，完成驗證後會自動恢復偵察');
+    }
+  } catch (e) {
+    log(`開啟驗證視窗失敗: ${e.message}`);
+  }
+  if (!opened) log('⚠️ 無法自動開啟驗證視窗，請手動點擊任一區域讓驗證跳出並完成');
+
+  // 每秒檢查遮罩：出現過且消失 = 驗證完成 → 自動恢復
+  let seen = false;
+  const poll = setInterval(() => {
+    if (!isRunning) { clearInterval(poll); return; }
+    if (findCaptchaInDoc(document, 0)) { seen = true; return; }
+    if (seen) {
+      clearInterval(poll);
+      log('✅ 驗證完成，恢復偵察');
+      window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'CAPTCHA_RESUMED' } }, '*');
+      scoutConsecAnomaly = 0;
+      cycleFn(); // scoutTick 開頭會解除 scoutBusy
+    }
+  }, 1000);
+}
+
+// 執行期從頁面 fnBlockSeatUpdate 原始碼抽出 BookSeatDetail 網址模板
+// （SessionId/GoodsCode 等參數寫死在該函式內，PlaySeq 從表單欄位取）
+function buildScoutUrlTemplate() {
+  let win = null;
+  if (typeof window.fnBlockSeatUpdate === 'function') win = window;
+  else win = findWinWithFn(document, 0);
+  if (!win) { log('⚠️ 偵察初始化：找不到 fnBlockSeatUpdate（請確認在訂票頁面）'); return null; }
+
+  try {
+    const src = win.fnBlockSeatUpdate.toString();
+    const raw = [...src.matchAll(/url\s*\+?=\s*"([^"]*)"/g)].map(m => m[1]).join('');
+    const qIdx = raw.indexOf('?');
+    if (!raw.includes('BookSeatDetail.asp') || qIdx < 0) {
+      log('⚠️ 偵察初始化：抽不出 BookSeatDetail 網址骨架（網站可能已改版）');
+      return null;
+    }
+
+    let playSeq = '';
+    try { playSeq = win.document.getElementById('PlaySeq')?.value || ''; } catch (_) {}
+    if (!playSeq) { log('⚠️ 偵察初始化：抓不到 PlaySeq（場次序號）'); return null; }
+
+    const path = raw.slice(0, qIdx);
+    const baseParams = new URLSearchParams(raw.slice(qIdx + 1));
+    baseParams.set('PlaySeq', playSeq);
+    baseParams.set('SeatGrade', '');
+    baseParams.set('SeatCheckCnt', '0');
+
+    return (zone) => {
+      const p = new URLSearchParams(baseParams);
+      p.set('Block', zone);
+      return path + '?' + p.toString();
+    };
+  } catch (e) {
+    log(`⚠️ 偵察初始化失敗: ${e.message}`);
+    return null;
+  }
+}
+
+// 座位頁原始 HTML 是無引號的 class=SeatN，正則需同時相容有無引號
+function countSeatN(text) {
+  return (text.match(/class=["']?SeatN\b/g) || []).length;
+}
+
+// 分類 fetch 回應：SEAT 座位頁 / DENIED 被擋 / CAPTCHA 驗證 / ANOMALY 異常
+function classifyResponse(status, text) {
+  if (status === 403 || text.includes('Access Denied')) return 'DENIED';
+  if (/class=["']?Seat[NRB]\b/.test(text)) return 'SEAT';
+  if (/captch|divCaptchaWrap/i.test(text)) return 'CAPTCHA';
+  return 'ANOMALY';
+}
+
+// 命中後開衝（清掉節拍器、設 busy 讓其他落地回應作廢）
+async function scoutStrike(zone, n) {
+  if (timer) { clearTimeout(timer); timer = null; }
+  scoutBusy = true;
+  deniedStreak = 0;
+  scoutConsecAnomaly = 0;
+  log(`🎯 偵察命中：${zone} 區有 ${n} 個可選座位，開衝！`);
+  const res = await enterZoneAndPick(zone);
+  if (res === 'FOUND') return; // enterZoneAndPick 內已 stop('FOUND')
+  if (res === 'DENIED')  { handleDeniedPause(); return; }
+  if (res === 'CAPTCHA') { pauseForCaptcha('選位頁', null); return; }
+  // 撲空（票剛被別人搶走）→ 立刻恢復滴灌
+  log('撲空，繼續偵察...');
+  timer = setTimeout(scoutTick, 300);
+}
+
+// 發出單一區域的偵察請求；回應落地當下立即分類處理
+async function scoutFetch(zone) {
+  scoutInFlight++;
+  let status = 0, text = null;
+  try {
+    const resp = await fetch(scoutBuildUrl(zone), { cache: 'no-store' });
+    status = resp.status;
+    text = await resp.text();
+  } catch (_) { /* 網路錯誤 → 視為異常回應 */ }
+  scoutInFlight--;
+
+  if (!isRunning || scoutBusy) return; // 已停止 / 開衝中 / 暫停中 → 丟棄
+
+  scoutWinTotal++;
+  const kind = text === null ? 'ANOMALY' : classifyResponse(status, text);
+
+  if (kind === 'SEAT') {
+    scoutWinNormal++;
+    scoutConsecAnomaly = 0;
+    deniedStreak = 0; // 正常看到座位頁 → Denied 連續計數歸零
+    const n = countSeatN(text);
+    if (n > 0) scoutStrike(zone, n);
+    return;
+  }
+
+  if (kind === 'DENIED') {
+    if (timer) { clearTimeout(timer); timer = null; }
+    scoutBusy = true; // 暫停期間落地的回應作廢；恢復時 scoutTick 會解除
+    handleDeniedPause();
+    return;
+  }
+
+  if (kind === 'CAPTCHA') {
+    pauseForCaptcha(`偵察回應（${zone} 區）`, text);
+    return;
+  }
+
+  // ANOMALY：連續異常達門檻（2 輪份量）→ 停止
+  scoutConsecAnomaly++;
+  const limit = Math.max(4, (config.zones?.length || 2) * 2);
+  if (scoutConsecAnomaly >= limit) {
+    if (timer) { clearTimeout(timer); timer = null; }
+    log(`⚠️ 連續 ${scoutConsecAnomaly} 個回應異常，停止搶票。請檢查頁面（可能 session 已失效）`);
+    window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'SCOUT_ANOMALY' } }, '*');
+    stop('ANOMALY');
+  }
+}
+
+// 滴灌節拍器：固定間隔發下一個請求（輪流換區），
+// 回應何時落地不影響節奏；在飛達上限時憋著不發
+function scoutTick() {
+  if (!isRunning) return;
+  scoutBusy = false; // 每次（重新）開始滴灌都解除 busy
+
+  if (config.durationMs > 0 && Date.now() - startTime > config.durationMs) {
+    log(`已達設定時間，停止搶票`);
+    stop('TIMEOUT');
+    return;
+  }
+
+  const zones = config.zones;
+  if (!zones?.length) { log('未設定任何區域'); stop('NO_ZONES'); return; }
+
+  // 頁面自己彈出驗證遮罩 → 暫停等解鎖
+  if (findCaptchaInDoc(document, 0)) { pauseForCaptcha('頁面', null); return; }
+
+  // 在飛達上限（伺服器變慢）→ 憋著，稍後再試，保證併發不疊到 3
+  if (scoutInFlight >= SCOUT_MAX_INFLIGHT) {
+    timer = setTimeout(scoutTick, 200);
+    return;
+  }
+
+  const zone = zones[scoutReqCount % zones.length];
+  scoutReqCount++;
+  scoutFetch(zone); // 不 await：解析在回應落地時自行進行
+
+  // 每完成一輪（所有區域都發過一次）回報一次：狀態列＋log 都更新，
+  // 讓使用者在畫面靜止的偵察模式隨時看得到「還在掃、掃到哪、沒票」
+  if (scoutReqCount % zones.length === 0) {
+    const round = scoutReqCount / zones.length;
+    zoneIndex = round; // 供 STATUS 查詢
+    const normal = scoutWinNormal, total = scoutWinTotal;
+    window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'SCOUT_ROUND', round, zones: zones.length, normal, total } }, '*');
+    log(`🛰️ 第 ${round} 輪掃完 ${zones.length} 區 · ${normal}/${total} 正常回應 · 無可選座位`);
+    scoutWinNormal = 0;
+    scoutWinTotal = 0;
+  }
+
+  timer = setTimeout(scoutTick, config.scoutIntervalMs || 800);
 }
 
 function start(cfg) {
@@ -726,8 +960,33 @@ function start(cfg) {
   zoneIndex = 0;
   deniedStreak = 0;
   startTime = Date.now();
-  log(`開始搶票！區域: [${cfg.zones.join(', ')}]，間隔: ${cfg.intervalMin}~${cfg.intervalMax}ms，持續: ${cfg.durationMs / 60000} 分鐘`);
-  runCycle();
+  scoutBuildUrl = null;
+  cycleFn = runCycle;
+
+  scoutReqCount = 0;
+  scoutInFlight = 0;
+  scoutBusy = false;
+  scoutWinNormal = 0;
+  scoutWinTotal = 0;
+  scoutConsecAnomaly = 0;
+
+  if (cfg.scoutMode) {
+    scoutBuildUrl = buildScoutUrlTemplate();
+    if (scoutBuildUrl) {
+      cycleFn = scoutTick;
+      const iv = cfg.scoutIntervalMs || 800;
+      log(`🛰️ 偵察模式：每 ${iv}ms 發 1 個請求輪流掃描 ${cfg.zones.length} 區（每區約每 ${(iv * cfg.zones.length / 1000).toFixed(1)} 秒檢查一次，併發上限 ${SCOUT_MAX_INFLIGHT}）`);
+    } else {
+      log('⚠️ 偵察初始化失敗，已自動改用盲輪模式');
+      window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'SCOUT_FALLBACK' } }, '*');
+    }
+  }
+  if (cycleFn === runCycle) {
+    log(`🔄 盲輪模式：換區間隔 ${cfg.intervalMin}~${cfg.intervalMax}ms`);
+  }
+
+  log(`開始搶票！區域: [${cfg.zones.join(', ')}]，持續: ${cfg.durationMs / 60000} 分鐘`);
+  cycleFn();
 }
 
 function stop(reason) {

@@ -276,10 +276,24 @@
     </div>
   </div>
 
-  <!-- 輪詢設定 -->
+  <!-- 搶票設定 -->
   <div class="section">
-    <div class="section-title">⏱️ 輪詢設定</div>
+    <div class="section-title">⏱️ 搶票設定</div>
     <div class="form-group">
+      <label>模式</label>
+      <label style="display:block; font-weight:normal; cursor:pointer; margin:4px 0;">
+        <input type="radio" name="runMode" id="modeScout" checked> 🛰️ 偵察模式（同時掃描所有區域，推薦）
+      </label>
+      <label style="display:block; font-weight:normal; cursor:pointer; margin:4px 0;">
+        <input type="radio" name="runMode" id="modeBlind"> 🔄 盲輪模式（逐區輪流點擊）
+      </label>
+    </div>
+    <div class="form-group" id="scoutFields">
+      <label>請求間隔（毫秒）</label>
+      <input type="number" id="scoutInterval" value="800" min="200" max="10000">
+      <div class="hint">💡 每隔多久發出一個偵察請求（一次只發一個、輪流換區）。每區被檢查的週期 = 間隔 × 區域數。被驗證/被擋就調大</div>
+    </div>
+    <div class="form-group" id="blindFields" style="display:none;">
       <label>換區間隔（毫秒）</label>
       <div class="row-2">
         <div>
