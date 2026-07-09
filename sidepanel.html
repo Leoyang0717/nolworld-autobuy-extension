@@ -282,16 +282,27 @@
     <div class="form-group">
       <label>模式</label>
       <label style="display:block; font-weight:normal; cursor:pointer; margin:4px 0;">
-        <input type="radio" name="runMode" id="modeScout" checked> 🛰️ 偵察模式（同時掃描所有區域，推薦）
+        <input type="radio" name="runMode" id="modeScout" checked> 🛰️ 偵察模式（背景請求逐區輪詢，推薦）
       </label>
       <label style="display:block; font-weight:normal; cursor:pointer; margin:4px 0;">
         <input type="radio" name="runMode" id="modeBlind"> 🔄 盲輪模式（逐區輪流點擊）
       </label>
     </div>
     <div class="form-group" id="scoutFields">
-      <label>請求間隔（毫秒）</label>
-      <input type="number" id="scoutInterval" value="800" min="200" max="10000">
-      <div class="hint">💡 每隔多久發出一個偵察請求（一次只發一個、輪流換區）。每區被檢查的週期 = 間隔 × 區域數。被驗證/被擋就調大</div>
+      <label>請求間隔（毫秒，隨機範圍）</label>
+      <div class="row-2">
+        <div>
+          <input type="number" id="scoutIntervalMin" value="1000" min="200" max="10000">
+          <div class="hint" style="text-align:center;">最小</div>
+        </div>
+        <div>
+          <input type="number" id="scoutIntervalMax" value="1200" min="200" max="10000">
+          <div class="hint" style="text-align:center;">最大</div>
+        </div>
+      </div>
+      <div class="hint" id="scoutEquiv" style="color:#2c5aa0;font-weight:600;">🔁 相同掃描速度 ≈ 盲輪 —</div>
+      <div class="hint">💡 建議 1000~1200ms（實測較不會觸發驗證）；時序隨機，較不像機器人。遇驗證/被擋就把兩個值一起調大。</div>
+      <div class="hint" style="color:#c0392b;">⚠️ 偵察若一直遇到驗證，改用「盲輪模式」——依上方「🔁 相同掃描速度」顯示的等效值設定盲輪間隔即可（盲輪指紋乾淨，較耐驗證）。</div>
     </div>
     <div class="form-group" id="blindFields" style="display:none;">
       <label>換區間隔（毫秒）</label>
@@ -305,7 +316,8 @@
           <div class="hint" style="text-align:center;">最大</div>
         </div>
       </div>
-      <div class="hint">💡 每次換區域等待的隨機時間，建議 800~1500ms</div>
+      <div class="hint" id="blindEquiv" style="color:#2c5aa0;font-weight:600;">🔁 相同掃描速度 ≈ 偵察 —</div>
+      <div class="hint">💡 每次換區域等待的隨機時間，建議 800~1000ms（比偵察多約 400ms 載入座位圖）。導航式請求指紋乾淨，較不會遇驗證，是偵察撞驗證時的穩定備援。</div>
     </div>
     <div class="form-group">
       <label>持續時間（分鐘）</label>

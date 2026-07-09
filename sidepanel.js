@@ -89,12 +89,14 @@ function addZone(code) {
   zones.push(code);
   renderZones();
   saveSettings();
+  updateEquiv(); // 區域數變動 → 換算的 400/N 項要重算
 }
 
 function removeZone(code) {
   zones = zones.filter(z => z !== code);
   renderZones();
   saveSettings();
+  updateEquiv();
 }
 
 function renderZones() {
@@ -148,6 +150,31 @@ function applyModeDisplay() {
   saveSettings();
 }));
 
+// ─── 偵察 ↔ 盲輪 間隔即時換算（含區域數）──────────────────
+// 兩者「每區被檢查週期」相同時掃描速度相同：
+//   盲輪每輪多花 iframe 載入(~400ms)；偵察命中後「發現即提交」幾乎零延遲，
+//   盲輪命中後約 200ms，此差×2 攤到 N 區 = 400/N。故：
+//   盲輪間隔 = 偵察間隔 − 400 − 400/N   （N = 目標區域數）
+const EQUIV_LOAD_MS = 400;  // 盲輪每輪多花的座位圖 iframe 載入
+const EQUIV_ACT_MS  = 400;  // 命中後動作差(盲輪~200ms − 偵察~0)×2 的分子
+function updateEquiv() {
+  const num = id => parseInt(document.getElementById(id).value) || 0;
+  const clamp = v => Math.max(200, Math.round(v));
+  const N = zones.length || 1;
+  const delta = EQUIV_LOAD_MS + EQUIV_ACT_MS / N;
+  const sMin = num('scoutIntervalMin'), sMax = num('scoutIntervalMax');
+  const bMin = num('intervalMin'),      bMax = num('intervalMax');
+  const note = zones.length ? `（依 ${zones.length} 區）` : '（未設區域，估 1 區）';
+  document.getElementById('scoutEquiv').textContent =
+    `🔁 相同掃描速度 ≈ 盲輪 ${clamp(sMin - delta)}~${clamp(sMax - delta)}ms ${note}`;
+  document.getElementById('blindEquiv').textContent =
+    `🔁 相同掃描速度 ≈ 偵察 ${clamp(bMin + delta)}~${clamp(bMax + delta)}ms ${note}`;
+}
+
+['scoutIntervalMin', 'scoutIntervalMax', 'intervalMin', 'intervalMax'].forEach(id =>
+  document.getElementById(id).addEventListener('input', updateEquiv)
+);
+
 // ─── 設定存取 ──────────────────────────────────────────────
 function saveSettings() {
   chrome.storage.local.set({
@@ -156,24 +183,27 @@ function saveSettings() {
     nolIntervalMax: parseInt(document.getElementById('intervalMax').value),
     nolDuration:    parseInt(document.getElementById('duration').value),
     nolSeatMapTimeout: parseInt(document.getElementById('seatMapTimeout').value) || 0,
-    nolScoutMode:  modeScoutEl.checked,
-    nolScoutReqMs: parseInt(document.getElementById('scoutInterval').value) || 800,
+    nolScoutMode:      modeScoutEl.checked,
+    nolScoutReqMin: parseInt(document.getElementById('scoutIntervalMin').value) || 1000,
+    nolScoutReqMax: parseInt(document.getElementById('scoutIntervalMax').value) || 1200,
   });
 }
 
 async function loadSettings() {
-  const s = await chrome.storage.local.get(['nolZones', 'nolIntervalMin', 'nolIntervalMax', 'nolDuration', 'nolSeatMapTimeout', 'nolScoutMode', 'nolScoutReqMs']);
+  const s = await chrome.storage.local.get(['nolZones', 'nolIntervalMin', 'nolIntervalMax', 'nolDuration', 'nolSeatMapTimeout', 'nolScoutMode', 'nolScoutReqMin', 'nolScoutReqMax']);
   if (s.nolZones) { zones = s.nolZones; renderZones(); }
   if (s.nolIntervalMin) document.getElementById('intervalMin').value = s.nolIntervalMin;
   if (s.nolIntervalMax) document.getElementById('intervalMax').value = s.nolIntervalMax;
   if (s.nolDuration)    document.getElementById('duration').value    = s.nolDuration;
   if (s.nolSeatMapTimeout !== undefined) document.getElementById('seatMapTimeout').value = s.nolSeatMapTimeout;
   if (s.nolScoutMode === false) { modeBlindEl.checked = true; modeScoutEl.checked = false; }
-  if (s.nolScoutReqMs) document.getElementById('scoutInterval').value = s.nolScoutReqMs;
+  if (s.nolScoutReqMin) document.getElementById('scoutIntervalMin').value = s.nolScoutReqMin;
+  if (s.nolScoutReqMax) document.getElementById('scoutIntervalMax').value = s.nolScoutReqMax;
   applyModeDisplay();
+  updateEquiv();
 }
 
-['intervalMin', 'intervalMax', 'duration', 'seatMapTimeout', 'scoutInterval'].forEach(id =>
+['intervalMin', 'intervalMax', 'duration', 'seatMapTimeout', 'scoutIntervalMin', 'scoutIntervalMax'].forEach(id =>
   document.getElementById(id).addEventListener('change', saveSettings)
 );
 
@@ -287,7 +317,8 @@ startBtn.addEventListener('click', async () => {
     intervalMax:  parseInt(document.getElementById('intervalMax').value) || 1500,
     durationMs:   (parseInt(document.getElementById('duration').value) || 9) * 60 * 1000,
     scoutMode,
-    scoutIntervalMs: parseInt(document.getElementById('scoutInterval').value) || 800,
+    scoutIntervalMin: parseInt(document.getElementById('scoutIntervalMin').value) || 1000,
+    scoutIntervalMax: parseInt(document.getElementById('scoutIntervalMax').value) || 1200,
   };
 
   const res = await sendToContent({ action: 'START', config, _ts: Date.now() });

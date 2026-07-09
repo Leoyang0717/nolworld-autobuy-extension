@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "NOL World 搶票助手",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "NOL World 自動刷票工具 - 區域輪詢、自動選位",
   "permissions": [
     "storage",

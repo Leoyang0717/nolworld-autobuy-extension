@@ -586,7 +586,7 @@ async function fillTicketCount() {
   const found = findSelectInDoc(document, 0);
   if (!found) {
     log('⚠️ 找不到票數選單，請手動選擇張數');
-    return;
+    return false;
   }
 
   const { selects, doc } = found;
@@ -614,6 +614,7 @@ async function fillTicketCount() {
   } else {
     log('⚠️ 找不到下一步按鈕，請手動點擊');
   }
+  return true;
 }
 
 // ─── 等待座位 iframe 載入完成 ────────────────────────────
@@ -728,8 +729,15 @@ async function runCycle() {
   timer = setTimeout(runCycle, interval);
 }
 
-// ─── 偵察模式：等速滴灌，逐一 fetch 各區座位頁比對文字 ────
+// ─── 偵察模式：滴灌 fetch 各區座位頁比對文字 ──────────────
 const SCOUT_MAX_INFLIGHT = 2; // 在飛請求上限（實測 3 併發會觸發驗證）
+
+// 每次發請求前的隨機等待（時序不固定，較不像機器人）
+function scoutRandomInterval() {
+  const min = config.scoutIntervalMin || 1000;
+  const max = config.scoutIntervalMax || 1200;
+  return min >= max ? min : min + Math.random() * (max - min);
+}
 
 let scoutReqCount = 0;      // 已發出的請求數（輪流換區用）
 let scoutInFlight = 0;      // 目前在飛的請求數
@@ -846,13 +854,73 @@ function classifyResponse(status, text) {
   return 'ANOMALY';
 }
 
+// ─── 發現即提交：從偵察回應直接解析座位參數並提交，繞過進場 ──
+// 座位頁每個可選座位帶 onclick="SelectSeat(this,'SeatGrade','Floor','RowNo','SeatNo','Block')"
+function parseFirstSeatParams(html) {
+  const m = html.match(/class=["']?SeatN\b[^>]*onclick="SelectSeat\(this,'([^']*)','([^']*)','([^']*)','([^']*)','([^']*)'\)/);
+  return m ? m.slice(1, 6) : null;
+}
+
+// 遞迴找同時擁有 fnAddSeat 與 fnSetPointDiscount 的 window（跨 iframe）
+function findSeatFnWin(win, depth) {
+  if (!win || depth > 5) return null;
+  try {
+    if (typeof win.fnAddSeat === 'function' && typeof win.fnSetPointDiscount === 'function') return win;
+  } catch (_) {}
+  try {
+    for (let i = 0; i < win.frames.length; i++) {
+      const r = findSeatFnWin(win.frames[i], depth + 1);
+      if (r) return r;
+    }
+  } catch (_) {}
+  return null;
+}
+
+// 用頁面函式直接選位並提交（fnAddSeat + fnSetPointDiscount）；成功回傳 true
+function submitSeatByParams(params) {
+  const win = findSeatFnWin(window, 0);
+  if (!win) { log('[發現即提交] 找不到選位函式 window'); return false; }
+  try {
+    const ok = win.fnAddSeat(params[0], params[1], params[2], params[3], params[4]);
+    if (!ok) { log('[發現即提交] fnAddSeat 回傳 false（座位已滿/無效）'); return false; }
+    win.fnSetPointDiscount();
+    log(`[發現即提交] 已送出 ${params[4]}區 ${params[2]} ${params[3]}`);
+    return true;
+  } catch (e) {
+    log(`[發現即提交] 失敗: ${e.message}`);
+    return false;
+  }
+}
+
 // 命中後開衝（清掉節拍器、設 busy 讓其他落地回應作廢）
-async function scoutStrike(zone, n) {
+async function scoutStrike(zone, n, html) {
   if (timer) { clearTimeout(timer); timer = null; }
   scoutBusy = true;
   deniedStreak = 0;
   scoutConsecAnomaly = 0;
   log(`🎯 偵察命中：${zone} 區有 ${n} 個可選座位，開衝！`);
+
+  // 優先走「發現即提交」：直接從回應解析座位參數、用頁面函式提交，繞過進場
+  const params = html ? parseFirstSeatParams(html) : null;
+  if (params && submitSeatByParams(params)) {
+    await new Promise(r => setTimeout(r, 200));
+    // 提交後被驗證擋下 → 暫停等解鎖
+    if (findCaptchaInDoc(document, 0)) { pauseForCaptcha('選位提交', null); return; }
+    // 等票數頁載入、自動填 1 張並按下一步
+    const ok = await fillTicketCount();
+    if (ok) {
+      window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'SEAT_FOUND', zone } }, '*');
+      stop('FOUND');
+      return;
+    }
+    // 沒進到票數頁 → 座位可能被搶走（撲空），恢復滴灌繼續掃
+    log('發現即提交後未進入票數頁（可能撲空），繼續偵察...');
+    timer = setTimeout(scoutTick, 300);
+    return;
+  }
+
+  // fallback：解析失敗或函式不可用 → 走舊的進場點擊
+  log('[發現即提交] 無法使用，改用進場點擊');
   const res = await enterZoneAndPick(zone);
   if (res === 'FOUND') return; // enterZoneAndPick 內已 stop('FOUND')
   if (res === 'DENIED')  { handleDeniedPause(); return; }
@@ -883,7 +951,7 @@ async function scoutFetch(zone) {
     scoutConsecAnomaly = 0;
     deniedStreak = 0; // 正常看到座位頁 → Denied 連續計數歸零
     const n = countSeatN(text);
-    if (n > 0) scoutStrike(zone, n);
+    if (n > 0) scoutStrike(zone, n, text);
     return;
   }
 
@@ -950,7 +1018,7 @@ function scoutTick() {
     scoutWinTotal = 0;
   }
 
-  timer = setTimeout(scoutTick, config.scoutIntervalMs || 800);
+  timer = setTimeout(scoutTick, scoutRandomInterval());
 }
 
 function start(cfg) {
@@ -974,8 +1042,10 @@ function start(cfg) {
     scoutBuildUrl = buildScoutUrlTemplate();
     if (scoutBuildUrl) {
       cycleFn = scoutTick;
-      const iv = cfg.scoutIntervalMs || 800;
-      log(`🛰️ 偵察模式：每 ${iv}ms 發 1 個請求輪流掃描 ${cfg.zones.length} 區（每區約每 ${(iv * cfg.zones.length / 1000).toFixed(1)} 秒檢查一次，併發上限 ${SCOUT_MAX_INFLIGHT}）`);
+      const lo = cfg.scoutIntervalMin || 1000;
+      const hi = cfg.scoutIntervalMax || 1200;
+      const avg = (lo + hi) / 2;
+      log(`🛰️ 偵察模式：每 ${lo}~${hi}ms 隨機發 1 個請求輪流掃描 ${cfg.zones.length} 區（每區約每 ${(avg * cfg.zones.length / 1000).toFixed(1)} 秒檢查一次，併發上限 ${SCOUT_MAX_INFLIGHT}）`);
     } else {
       log('⚠️ 偵察初始化失敗，已自動改用盲輪模式');
       window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'SCOUT_FALLBACK' } }, '*');
