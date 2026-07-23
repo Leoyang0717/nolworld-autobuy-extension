@@ -326,6 +326,28 @@
     </div>
   </div>
 
+  <!-- 背景剩餘座位監控 -->
+  <div class="section">
+    <div class="section-title">🛰️ 背景剩餘座位監控</div>
+    <label style="display:block; font-weight:normal; cursor:pointer; margin:4px 0;">
+      <input type="checkbox" id="monitorEnabled"> 啟用（與上方模式並行運作）
+    </label>
+    <div class="form-group" id="monitorFields" style="display:none;">
+      <div class="row-2">
+        <div>
+          <input type="number" id="monitorInterval" value="5" min="2" max="60">
+          <div class="hint" style="text-align:center;">掃描間隔（秒）</div>
+        </div>
+        <div>
+          <input type="number" id="monitorMinRemain" value="1" min="1" max="99">
+          <div class="hint" style="text-align:center;">剩餘門檻（≥）</div>
+        </div>
+      </div>
+      <div class="hint">💡 每隔數秒打一次「全區剩餘座位 API」，發現有票的區就自動指揮主模式改刷該區；鎖定一區至少刷 60 秒，售完或逾時無斬獲才換區/回到指定區。</div>
+      <div class="hint" style="color:#c0392b;">⚠️ 只對「有顯示剩餘數」的活動有效；掃描是額外請求，間隔別調太小以免觸發風控。</div>
+    </div>
+  </div>
+
   <!-- 狀態 -->
   <div class="section">
     <div class="section-title">📊 狀態</div>

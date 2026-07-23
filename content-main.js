@@ -18,6 +18,18 @@ let deniedStreak = 0; // 連續偵測到 Access Denied 的次數（看到正常�
 let cycleFn = null;    // 當前模式的主循環（runCycle 或 scoutTick）
 let scoutBuildUrl = null; // 偵察網址產生函式 (zone) => url，初始化失敗為 null
 
+// ─── 背景剩餘座位監控（並行於盲輪/偵察，只「看與指揮」不提交）──
+let monitorTimer = null;      // 監控節拍器
+let monitorInFlight = false;  // AllBlock 請求單飛防護（前一發未回不發下一發）
+let monitorBuildUrl = null;   // AllBlock 網址產生函式 () => url，初始化失敗為 null
+let remainMap = {};           // 區碼 -> { block, remain, grade, gradeName }（保序＝API 順序）
+let monitorOverride = null;   // { zone, since } 目前鎖定要主模式改刷的區；null＝不干預
+let monitorLastAvailSig = ''; // 上次「有票區集合」簽章，變化才 log，避免洗版
+let monitorLockHits = 0;      // 本次鎖定已集中刷幾次（偵察心跳計數）
+let monitorHeartbeatTs = 0;   // 上次心跳 log 時間戳
+const MONITOR_DWELL_MS = 60000; // 鎖定一區至少停留 60 秒，防止區間反覆橫跳
+const MONITOR_HEARTBEAT_MS = 5000; // 偵察鎖定期間，每隔多久印一次心跳 log
+
 let watchTimer = null;
 let watchObserver = null;
 
@@ -714,10 +726,11 @@ async function runCycle() {
   const zones = config.zones;
   if (!zones?.length) { log('未設定任何區域'); stop('NO_ZONES'); return; }
 
-  const zoneCode = zones[zoneIndex % zones.length];
+  // 背景監控鎖定某有票區時，優先改刷該區；否則照原輪詢
+  const zoneCode = monitorOverride?.zone ?? zones[zoneIndex % zones.length];
   zoneIndex++;
 
-  log(`嘗試 ${zoneCode} 區域（第 ${zoneIndex} 次）`);
+  log(`嘗試 ${zoneCode} 區域（第 ${zoneIndex} 次）${monitorOverride ? '🎯監控鎖定' : ''}`);
   const res = await enterZoneAndPick(zoneCode);
   if (res === 'FOUND') return;
   if (res === 'DENIED')  { handleDeniedPause(); return; }
@@ -1002,13 +1015,25 @@ function scoutTick() {
     return;
   }
 
-  const zone = zones[scoutReqCount % zones.length];
+  // 背景監控鎖定某有票區時，集中火力偵察該區；否則照原輪詢
+  const zone = monitorOverride?.zone ?? zones[scoutReqCount % zones.length];
   scoutReqCount++;
   scoutFetch(zone); // 不 await：解析在回應落地時自行進行
 
+  // 偵察鎖定期間，逐次請求本來不印 → 補心跳，讓使用者確定仍在集中刷、剩餘多少
+  if (monitorOverride) {
+    monitorLockHits++;
+    const now2 = Date.now();
+    if (now2 - monitorHeartbeatTs >= MONITOR_HEARTBEAT_MS) {
+      monitorHeartbeatTs = now2;
+      const info = remainMap[zone];
+      log(`🎯 ${zone} 集中刷第 ${monitorLockHits} 次·剩餘 ${info ? info.remain : '?'}·仍未搶到`);
+    }
+  }
+
   // 每完成一輪（所有區域都發過一次）回報一次：狀態列＋log 都更新，
   // 讓使用者在畫面靜止的偵察模式隨時看得到「還在掃、掃到哪、沒票」
-  if (scoutReqCount % zones.length === 0) {
+  if (!monitorOverride && scoutReqCount % zones.length === 0) {
     const round = scoutReqCount / zones.length;
     zoneIndex = round; // 供 STATUS 查詢
     const normal = scoutWinNormal, total = scoutWinTotal;
@@ -1019,6 +1044,165 @@ function scoutTick() {
   }
 
   timer = setTimeout(scoutTick, scoutRandomInterval());
+}
+
+// ─── 背景剩餘座位監控 ────────────────────────────────────
+// 執行期從頁面 fnBlockUpdate 原始碼抽出 AllBlock 網址（含 SessionId，寫死在函式內）
+function buildRemainUrl() {
+  let win = null;
+  if (typeof window.fnBlockUpdate === 'function') win = window;
+  else win = findWinWithNamedFn(document, 'fnBlockUpdate', 0);
+  if (!win) { log('⚠️ 監控初始化：找不到 fnBlockUpdate（請確認在訂票頁面）'); return null; }
+
+  try {
+    const src = win.fnBlockUpdate.toString();
+    const raw = [...src.matchAll(/url\s*\+?=\s*"([^"]*)"/g)].map(m => m[1]).join('');
+    const qIdx = raw.indexOf('?');
+    if (!raw.includes('BookInfoXml.asp') || !raw.includes('AllBlock') || qIdx < 0) {
+      log('⚠️ 監控初始化：抽不出 AllBlock 網址骨架（網站可能已改版）');
+      return null;
+    }
+
+    let playSeq = '';
+    try { playSeq = win.document.getElementById('PlaySeq')?.value || ''; } catch (_) {}
+    if (!playSeq) { log('⚠️ 監控初始化：抓不到 PlaySeq（場次序號）'); return null; }
+
+    const path = raw.slice(0, qIdx);
+    const baseParams = new URLSearchParams(raw.slice(qIdx + 1));
+    baseParams.set('PlaySeq', playSeq);
+    return () => path + '?' + baseParams.toString();
+  } catch (e) {
+    log(`⚠️ 監控初始化失敗: ${e.message}`);
+    return null;
+  }
+}
+
+// 解析 AllBlock 回應 XML → [{ block, remain, grade, gradeName }]（保序）
+function parseRemainXml(text) {
+  const out = [];
+  try {
+    const doc = new DOMParser().parseFromString(text, 'application/xml');
+    for (const t of doc.querySelectorAll('Table')) {
+      const block = t.querySelector('SelfDefineBlock')?.textContent?.trim();
+      if (!block) continue;
+      const remain = parseInt((t.querySelector('RemainCnt')?.textContent || '0').replace(/,/g, ''), 10) || 0;
+      out.push({
+        block,
+        remain,
+        grade: t.querySelector('SeatGrade')?.textContent?.trim() || '',
+        gradeName: t.querySelector('SeatGradeName')?.textContent?.trim() || '',
+      });
+    }
+  } catch (_) {}
+  return out;
+}
+
+// 依決策挑目標區：先指定清單內有票者（依清單序），再非指定有票者（依 API 序）
+function pickTarget() {
+  const threshold = config.monitorMinRemain || 1;
+  const designated = config.zones || [];
+  for (const z of designated) {
+    if (remainMap[z] && remainMap[z].remain >= threshold) return z;
+  }
+  for (const r of Object.values(remainMap)) {
+    if (r.remain >= threshold && !designated.includes(r.block)) return r.block;
+  }
+  return null;
+}
+
+function setMonitorOverride(zone, now) {
+  const changed = !monitorOverride || monitorOverride.zone !== zone;
+  monitorOverride = { zone, since: now };
+  if (changed) {
+    monitorLockHits = 0;
+    monitorHeartbeatTs = now; // 首次心跳排在切區後約 MONITOR_HEARTBEAT_MS，避免與切區 log 疊在一起
+    const info = remainMap[zone];
+    log(`🎯 切換到有票區 ${zone}（剩餘 ${info ? info.remain : '?'}）→ 主模式改刷此區`);
+    window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'REMAIN_SWITCH', zone, remain: info ? info.remain : 0 } }, '*');
+  }
+}
+
+function clearMonitorOverride() {
+  if (!monitorOverride) return;
+  const zone = monitorOverride.zone;
+  monitorOverride = null;
+  log(`↩️ ${zone} 售完且無其他有票區，回到指定區域輪刷`);
+  window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'REMAIN_REVERT', zone } }, '*');
+}
+
+// 每次掃描後套用切區決策（承諾機制：鎖定區至少停留 MONITOR_DWELL_MS）
+function applyMonitorDecision() {
+  const threshold = config.monitorMinRemain || 1;
+  const candidate = pickTarget();
+  const now = Date.now();
+
+  if (monitorOverride) {
+    const cur = remainMap[monitorOverride.zone];
+    const curRemain = cur ? cur.remain : 0;
+    if (curRemain < threshold) {
+      // 鎖定區售完 → 有他區則轉移（重置停留），否則放手回指定區
+      if (candidate) setMonitorOverride(candidate, now);
+      else clearMonitorOverride();
+    } else if (now - monitorOverride.since >= MONITOR_DWELL_MS && candidate && candidate !== monitorOverride.zone) {
+      // 滿 60 秒仍未搶到、且他區有票 → 跳去他區
+      setMonitorOverride(candidate, now);
+    }
+    // 否則：承諾期內或無更好選擇 → 續刷目前鎖定區
+  } else if (candidate) {
+    setMonitorOverride(candidate, now); // 從無到有 → 鎖定
+  }
+}
+
+// 發一次 AllBlock 掃全區，更新 remainMap，套用決策
+async function monitorScan() {
+  if (!isRunning || monitorInFlight) return;
+  monitorInFlight = true;
+  let status = 0, text = null;
+  try {
+    const resp = await fetch(monitorBuildUrl(), { cache: 'no-store' });
+    status = resp.status;
+    text = await resp.text();
+  } catch (_) { /* 網路錯誤 → 本次略過 */ }
+  monitorInFlight = false;
+  if (!isRunning) return;
+
+  // 被擋：不動 remainMap、不干預；讓主模式的 Denied 處理去暫停
+  if (status === 403 || (text && text.includes('Access Denied'))) return;
+
+  const rows = text ? parseRemainXml(text) : [];
+  if (!rows.length) return; // 解析失敗（非全部售完）→ 保留舊表，不清空
+
+  remainMap = {};
+  rows.forEach(r => { remainMap[r.block] = r; });
+
+  // 有票區集合變化才 log 摘要，避免每次掃描洗版
+  const threshold = config.monitorMinRemain || 1;
+  const avail = rows.filter(r => r.remain >= threshold);
+  const sig = avail.map(r => `${r.block}:${r.remain}`).join(',');
+  if (sig !== monitorLastAvailSig) {
+    monitorLastAvailSig = sig;
+    if (avail.length) log(`🛰️ 全區掃描：${avail.length} 區有票（${avail.map(r => `${r.block}×${r.remain}`).join('、')}）`);
+    else log('🛰️ 全區掃描：目前全數無票');
+    window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'REMAIN_SCAN', count: avail.length } }, '*');
+  }
+
+  applyMonitorDecision();
+}
+
+// 監控節拍器：固定秒數掃一次；被擋/開衝期間跳過本次（避免火上加油）
+function monitorTick() {
+  if (!isRunning) return;
+  if (config.durationMs > 0 && Date.now() - startTime > config.durationMs) return; // 主迴圈會 stop
+  const sec = config.monitorInterval || 5;
+
+  if (deniedStreak > 0 || scoutBusy) {
+    monitorTimer = setTimeout(monitorTick, sec * 1000);
+    return;
+  }
+
+  monitorScan().finally(() => {
+    if (isRunning) monitorTimer = setTimeout(monitorTick, sec * 1000);
+  });
 }
 
 function start(cfg) {
@@ -1038,6 +1222,14 @@ function start(cfg) {
   scoutWinTotal = 0;
   scoutConsecAnomaly = 0;
 
+  monitorOverride = null;
+  remainMap = {};
+  monitorInFlight = false;
+  monitorBuildUrl = null;
+  monitorLastAvailSig = '';
+  monitorLockHits = 0;
+  monitorHeartbeatTs = 0;
+
   if (cfg.scoutMode) {
     scoutBuildUrl = buildScoutUrlTemplate();
     if (scoutBuildUrl) {
@@ -1055,6 +1247,18 @@ function start(cfg) {
     log(`🔄 盲輪模式：換區間隔 ${cfg.intervalMin}~${cfg.intervalMax}ms`);
   }
 
+  // 背景剩餘座位監控：與盲輪/偵察並行，只掃全區 RemainCnt 指揮主模式改刷有票區
+  if (cfg.monitorEnabled) {
+    monitorBuildUrl = buildRemainUrl();
+    if (monitorBuildUrl) {
+      const sec = cfg.monitorInterval || 5;
+      log(`🛰️ 背景剩餘監控啟動：每 ${sec} 秒掃全區一次（門檻 RemainCnt≥${cfg.monitorMinRemain || 1}，鎖定區至少停留 ${MONITOR_DWELL_MS / 1000} 秒）`);
+      monitorTimer = setTimeout(monitorTick, sec * 1000);
+    } else {
+      log('⚠️ 背景剩餘監控初始化失敗（抓不出 AllBlock 網址），本次不啟用監控');
+    }
+  }
+
   log(`開始搶票！區域: [${cfg.zones.join(', ')}]，持續: ${cfg.durationMs / 60000} 分鐘`);
   cycleFn();
 }
@@ -1062,6 +1266,8 @@ function start(cfg) {
 function stop(reason) {
   isRunning = false;
   if (timer) { clearTimeout(timer); timer = null; }
+  if (monitorTimer) { clearTimeout(monitorTimer); monitorTimer = null; }
+  monitorOverride = null;
   log(`已停止（${reason || 'MANUAL'}）`);
   window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'STOPPED', reason } }, '*');
 }

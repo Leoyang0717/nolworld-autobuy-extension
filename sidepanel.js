@@ -186,11 +186,14 @@ function saveSettings() {
     nolScoutMode:      modeScoutEl.checked,
     nolScoutReqMin: parseInt(document.getElementById('scoutIntervalMin').value) || 1000,
     nolScoutReqMax: parseInt(document.getElementById('scoutIntervalMax').value) || 1200,
+    nolMonitorEnabled:  document.getElementById('monitorEnabled').checked,
+    nolMonitorInterval: parseInt(document.getElementById('monitorInterval').value) || 5,
+    nolMonitorMinRemain: parseInt(document.getElementById('monitorMinRemain').value) || 1,
   });
 }
 
 async function loadSettings() {
-  const s = await chrome.storage.local.get(['nolZones', 'nolIntervalMin', 'nolIntervalMax', 'nolDuration', 'nolSeatMapTimeout', 'nolScoutMode', 'nolScoutReqMin', 'nolScoutReqMax']);
+  const s = await chrome.storage.local.get(['nolZones', 'nolIntervalMin', 'nolIntervalMax', 'nolDuration', 'nolSeatMapTimeout', 'nolScoutMode', 'nolScoutReqMin', 'nolScoutReqMax', 'nolMonitorEnabled', 'nolMonitorInterval', 'nolMonitorMinRemain']);
   if (s.nolZones) { zones = s.nolZones; renderZones(); }
   if (s.nolIntervalMin) document.getElementById('intervalMin').value = s.nolIntervalMin;
   if (s.nolIntervalMax) document.getElementById('intervalMax').value = s.nolIntervalMax;
@@ -199,13 +202,28 @@ async function loadSettings() {
   if (s.nolScoutMode === false) { modeBlindEl.checked = true; modeScoutEl.checked = false; }
   if (s.nolScoutReqMin) document.getElementById('scoutIntervalMin').value = s.nolScoutReqMin;
   if (s.nolScoutReqMax) document.getElementById('scoutIntervalMax').value = s.nolScoutReqMax;
+  if (s.nolMonitorEnabled) document.getElementById('monitorEnabled').checked = true;
+  if (s.nolMonitorInterval) document.getElementById('monitorInterval').value = s.nolMonitorInterval;
+  if (s.nolMonitorMinRemain) document.getElementById('monitorMinRemain').value = s.nolMonitorMinRemain;
   applyModeDisplay();
+  applyMonitorDisplay();
   updateEquiv();
 }
 
-['intervalMin', 'intervalMax', 'duration', 'seatMapTimeout', 'scoutIntervalMin', 'scoutIntervalMax'].forEach(id =>
+['intervalMin', 'intervalMax', 'duration', 'seatMapTimeout', 'scoutIntervalMin', 'scoutIntervalMax', 'monitorInterval', 'monitorMinRemain'].forEach(id =>
   document.getElementById(id).addEventListener('change', saveSettings)
 );
+
+// ─── 背景監控開關顯示 ──────────────────────────────────────
+const monitorEnabledEl = document.getElementById('monitorEnabled');
+const monitorFieldsEl = document.getElementById('monitorFields');
+function applyMonitorDisplay() {
+  monitorFieldsEl.style.display = monitorEnabledEl.checked ? 'block' : 'none';
+}
+monitorEnabledEl.addEventListener('change', () => {
+  applyMonitorDisplay();
+  saveSettings();
+});
 
 // ─── 日誌 ──────────────────────────────────────────────────
 function appendLog(msg, type = '') {
@@ -319,6 +337,9 @@ startBtn.addEventListener('click', async () => {
     scoutMode,
     scoutIntervalMin: parseInt(document.getElementById('scoutIntervalMin').value) || 1000,
     scoutIntervalMax: parseInt(document.getElementById('scoutIntervalMax').value) || 1200,
+    monitorEnabled:   document.getElementById('monitorEnabled').checked,
+    monitorInterval:  parseInt(document.getElementById('monitorInterval').value) || 5,
+    monitorMinRemain: parseInt(document.getElementById('monitorMinRemain').value) || 1,
   };
 
   const res = await sendToContent({ action: 'START', config, _ts: Date.now() });
@@ -388,6 +409,14 @@ chrome.runtime.onMessage.addListener((msg) => {
       const total = msg.total ?? msg.zones;
       setStatus(`🛰️ 偵察中 第 ${msg.round} 輪・已掃 ${msg.zones} 區・${normal}/${total} 正常・無票`, 'running');
     }
+  }
+
+  // 背景監控：切到有票區 / 回到指定區（文字已由 LOG 呈現，這裡更新狀態列）
+  if (msg.action === 'REMAIN_SWITCH' && isRunning) {
+    setStatus(`🎯 監控鎖定有票區 ${msg.zone}（剩餘 ${msg.remain}）・集中刷此區`, 'running');
+  }
+  if (msg.action === 'REMAIN_REVERT' && isRunning) {
+    setStatus(`↩️ ${msg.zone} 售完，回到指定區域輪刷`, 'running');
   }
 
   if (msg.action === 'CAPTCHA_PAUSE') {
