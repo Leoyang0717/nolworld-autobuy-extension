@@ -274,6 +274,14 @@
       </div>
       <div class="hint">💡 依序輪流嘗試；拖曳可調整優先順序</div>
     </div>
+    <div class="form-group">
+      <label>排除區域（不想要的區，按 Enter 或逗號新增）</label>
+      <div class="zone-input-wrapper" id="excludeWrapper">
+        <input type="text" id="excludeInput" placeholder="例如：011、012（站立/不要的區）">
+      </div>
+      <div class="hint">🚫 絕對不刷（盲輪／偵察／監控全部跳過），優先權高於指定區。放掉不想要的座位後，把該區加進這裡再重按開始，就不會又抓回同一區。</div>
+      <div id="excludeConflict" style="display:none; margin-top:6px; padding:6px 8px; background:#fdecea; border:1px solid #f5c6cb; border-radius:6px; color:#c0392b; font-size:12px; line-height:1.4;"></div>
+    </div>
   </div>
 
   <!-- 搶票設定 -->

@@ -2,6 +2,7 @@
 
 // ─── 狀態 ──────────────────────────────────────────────────
 let zones = [];
+let excludeZones = []; // 排除區域（不想要的區，含背景監控一律略過）
 let isRunning = false;
 let isWatching = false;
 let statsTimer = null;
@@ -10,6 +11,8 @@ let startTimestamp = null;
 // ─── DOM ───────────────────────────────────────────────────
 const zoneWrapper = document.getElementById('zoneWrapper');
 const zoneInput   = document.getElementById('zoneInput');
+const excludeWrapper = document.getElementById('excludeWrapper');
+const excludeInput   = document.getElementById('excludeInput');
 const startBtn    = document.getElementById('startBtn');
 const stopBtn     = document.getElementById('stopBtn');
 const statusBox   = document.getElementById('statusBox');
@@ -88,6 +91,7 @@ function addZone(code) {
   if (!code || zones.includes(code)) return;
   zones.push(code);
   renderZones();
+  updateExcludeConflict();
   saveSettings();
   updateEquiv(); // 區域數變動 → 換算的 400/N 項要重算
 }
@@ -95,6 +99,7 @@ function addZone(code) {
 function removeZone(code) {
   zones = zones.filter(z => z !== code);
   renderZones();
+  updateExcludeConflict();
   saveSettings();
   updateEquiv();
 }
@@ -130,6 +135,67 @@ zoneInput.addEventListener('blur', () => {
   if (zoneInput.value.trim()) {
     addZone(zoneInput.value);
     zoneInput.value = '';
+  }
+});
+
+// ─── 排除區域 Tag 管理（結構同上，另一份清單）──────────────
+function addExcludeZone(code) {
+  code = code.trim().replace(/[,，]/g, '');
+  if (!code || excludeZones.includes(code)) return;
+  excludeZones.push(code);
+  renderExcludeZones();
+  updateExcludeConflict();
+  saveSettings();
+}
+
+function removeExcludeZone(code) {
+  excludeZones = excludeZones.filter(z => z !== code);
+  renderExcludeZones();
+  updateExcludeConflict();
+  saveSettings();
+}
+
+// 提示：同時出現在指定與排除清單的區，會以排除為準（不會刷）
+function updateExcludeConflict() {
+  const el = document.getElementById('excludeConflict');
+  const dup = excludeZones.filter(z => zones.includes(z));
+  if (dup.length) {
+    el.textContent = `⚠️ 這些區同時在「指定」與「排除」清單：[${dup.join(', ')}]，將以排除為準，一律不刷。`;
+    el.style.display = 'block';
+  } else {
+    el.style.display = 'none';
+  }
+}
+
+function renderExcludeZones() {
+  [...excludeWrapper.querySelectorAll('.zone-tag')].forEach(el => el.remove());
+  excludeZones.forEach(code => {
+    const tag = document.createElement('div');
+    tag.className = 'zone-tag';
+    tag.innerHTML = `${code}<span class="zone-tag-remove" data-code="${code}">×</span>`;
+    excludeWrapper.insertBefore(tag, excludeInput);
+  });
+  excludeWrapper.querySelectorAll('.zone-tag-remove').forEach(btn => {
+    btn.addEventListener('click', () => removeExcludeZone(btn.dataset.code));
+  });
+}
+
+excludeWrapper.addEventListener('click', () => excludeInput.focus());
+
+excludeInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter' || e.key === ',' || e.key === '，') {
+    e.preventDefault();
+    addExcludeZone(excludeInput.value);
+    excludeInput.value = '';
+  } else if (e.key === 'Backspace' && excludeInput.value === '' && excludeZones.length > 0) {
+    removeExcludeZone(excludeZones[excludeZones.length - 1]);
+  }
+});
+
+excludeInput.addEventListener('blur', () => {
+  if (excludeInput.value.trim()) {
+    addExcludeZone(excludeInput.value);
+    excludeInput.value = '';
   }
 });
 
@@ -179,6 +245,7 @@ function updateEquiv() {
 function saveSettings() {
   chrome.storage.local.set({
     nolZones: zones,
+    nolExcludeZones: excludeZones,
     nolIntervalMin: parseInt(document.getElementById('intervalMin').value),
     nolIntervalMax: parseInt(document.getElementById('intervalMax').value),
     nolDuration:    parseInt(document.getElementById('duration').value),
@@ -193,8 +260,9 @@ function saveSettings() {
 }
 
 async function loadSettings() {
-  const s = await chrome.storage.local.get(['nolZones', 'nolIntervalMin', 'nolIntervalMax', 'nolDuration', 'nolSeatMapTimeout', 'nolScoutMode', 'nolScoutReqMin', 'nolScoutReqMax', 'nolMonitorEnabled', 'nolMonitorInterval', 'nolMonitorMinRemain']);
+  const s = await chrome.storage.local.get(['nolZones', 'nolExcludeZones', 'nolIntervalMin', 'nolIntervalMax', 'nolDuration', 'nolSeatMapTimeout', 'nolScoutMode', 'nolScoutReqMin', 'nolScoutReqMax', 'nolMonitorEnabled', 'nolMonitorInterval', 'nolMonitorMinRemain']);
   if (s.nolZones) { zones = s.nolZones; renderZones(); }
+  if (s.nolExcludeZones) { excludeZones = s.nolExcludeZones; renderExcludeZones(); }
   if (s.nolIntervalMin) document.getElementById('intervalMin').value = s.nolIntervalMin;
   if (s.nolIntervalMax) document.getElementById('intervalMax').value = s.nolIntervalMax;
   if (s.nolDuration)    document.getElementById('duration').value    = s.nolDuration;
@@ -207,6 +275,7 @@ async function loadSettings() {
   if (s.nolMonitorMinRemain) document.getElementById('monitorMinRemain').value = s.nolMonitorMinRemain;
   applyModeDisplay();
   applyMonitorDisplay();
+  updateExcludeConflict();
   updateEquiv();
 }
 
@@ -331,6 +400,7 @@ startBtn.addEventListener('click', async () => {
   const scoutMode = document.getElementById('modeScout').checked;
   const config = {
     zones,
+    excludeZones,
     intervalMin:  parseInt(document.getElementById('intervalMin').value) || 800,
     intervalMax:  parseInt(document.getElementById('intervalMax').value) || 1500,
     durationMs:   (parseInt(document.getElementById('duration').value) || 9) * 60 * 1000,
@@ -354,7 +424,7 @@ startBtn.addEventListener('click', async () => {
     setStatus(`🔄 刷票中... 區域: [${zones.join(', ')}]`, 'running');
   }
   startStatsTimer();
-  appendLog(`▶ 開始搶票（${scoutMode ? '偵察' : '盲輪'}模式），區域: [${zones.join(', ')}]`, 'success');
+  appendLog(`▶ 開始搶票（${scoutMode ? '偵察' : '盲輪'}模式），區域: [${zones.join(', ')}]${excludeZones.length ? `，排除: [${excludeZones.join(', ')}]` : ''}`, 'success');
 });
 
 stopBtn.addEventListener('click', async () => {

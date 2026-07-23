@@ -726,8 +726,17 @@ async function runCycle() {
   const zones = config.zones;
   if (!zones?.length) { log('未設定任何區域'); stop('NO_ZONES'); return; }
 
-  // 背景監控鎖定某有票區時，優先改刷該區；否則照原輪詢
-  const zoneCode = monitorOverride?.zone ?? zones[zoneIndex % zones.length];
+  // 背景監控鎖定某有票區時優先改刷該區；否則在「指定區扣掉排除區」中輪詢
+  let zoneCode = monitorOverride?.zone;
+  if (!zoneCode) {
+    const active = zones.filter(z => !isExcluded(z));
+    if (!active.length) {
+      // 指定區全被排除：監控開著就等它指路，否則停止
+      if (config.monitorEnabled) { timer = setTimeout(runCycle, randomInterval()); return; }
+      log('⚠️ 所有指定區域都在排除清單中，無可刷區域'); stop('NO_ZONES'); return;
+    }
+    zoneCode = active[zoneIndex % active.length];
+  }
   zoneIndex++;
 
   log(`嘗試 ${zoneCode} 區域（第 ${zoneIndex} 次）${monitorOverride ? '🎯監控鎖定' : ''}`);
@@ -1015,8 +1024,16 @@ function scoutTick() {
     return;
   }
 
-  // 背景監控鎖定某有票區時，集中火力偵察該區；否則照原輪詢
-  const zone = monitorOverride?.zone ?? zones[scoutReqCount % zones.length];
+  // 背景監控鎖定某有票區時集中火力偵察該區；否則在「指定區扣掉排除區」中輪詢
+  let zone = monitorOverride?.zone;
+  if (!zone) {
+    const active = zones.filter(z => !isExcluded(z));
+    if (!active.length) {
+      if (config.monitorEnabled) { timer = setTimeout(scoutTick, scoutRandomInterval()); return; }
+      log('⚠️ 所有指定區域都在排除清單中，無可刷區域'); stop('NO_ZONES'); return;
+    }
+    zone = active[scoutReqCount % active.length];
+  }
   scoutReqCount++;
   scoutFetch(zone); // 不 await：解析在回應落地時自行進行
 
@@ -1109,15 +1126,20 @@ function parseRemainXml(text) {
   return out;
 }
 
-// 依決策挑目標區：先指定清單內有票者（依清單序），再非指定有票者（依 API 序）
+// 是否為使用者的排除區域（放票重搶時避免重抓同一區）
+function isExcluded(zone) {
+  return !!(config.excludeZones && config.excludeZones.includes(zone));
+}
+
+// 依決策挑目標區：先指定清單內有票者（依清單序），再非指定有票者（依 API 序）；排除區一律略過
 function pickTarget() {
   const threshold = config.monitorMinRemain || 1;
   const designated = config.zones || [];
   for (const z of designated) {
-    if (remainMap[z] && remainMap[z].remain >= threshold) return z;
+    if (!isExcluded(z) && remainMap[z] && remainMap[z].remain >= threshold) return z;
   }
   for (const r of Object.values(remainMap)) {
-    if (r.remain >= threshold && !designated.includes(r.block)) return r.block;
+    if (r.remain >= threshold && !designated.includes(r.block) && !isExcluded(r.block)) return r.block;
   }
   return null;
 }
