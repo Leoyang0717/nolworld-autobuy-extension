@@ -1056,21 +1056,33 @@ function buildRemainUrl() {
 
   try {
     const src = win.fnBlockUpdate.toString();
-    const raw = [...src.matchAll(/url\s*\+?=\s*"([^"]*)"/g)].map(m => m[1]).join('');
-    const qIdx = raw.indexOf('?');
-    if (!raw.includes('BookInfoXml.asp') || !raw.includes('AllBlock') || qIdx < 0) {
-      log('⚠️ 監控初始化：抽不出 AllBlock 網址骨架（網站可能已改版）');
-      return null;
+    // fnBlockUpdate 是單行 var url = "前段" + $F("PlaySeq") + "後段(含SessionId)";
+    // 舊寫法只抓第一個字串字面量會漏掉 $F 之後整段（含 SessionId）→ 改成還原整條運算式。
+    // 取所有 url = / url += 的右側（到分號），相容單行串接與多行 += 兩種寫法。
+    const segs = [...src.matchAll(/url\s*\+?=\s*([^;]+);/g)].map(m => m[1]);
+    if (!segs.length) { log('⚠️ 監控初始化：抽不出 fnBlockUpdate 內的 url 指派'); return null; }
+
+    // 把 $F("欄位") 換成該欄位當前值（轉為字串字面量）；其餘非字面量 token 會在下一步被略過
+    const combined = segs.join(' + ').replace(/\$F\(\s*['"]([^'"]+)['"]\s*\)/g, (_, field) => {
+      let v = '';
+      try { v = win.document.getElementById(field)?.value || ''; } catch (_) {}
+      return JSON.stringify(v);
+    });
+
+    // 串接所有字串字面量，還原完整 URL
+    const url = [...combined.matchAll(/"([^"]*)"|'([^']*)'/g)]
+      .map(x => x[1] !== undefined ? x[1] : x[2]).join('');
+
+    if (!url.includes('BookInfoXml.asp') || !url.includes('AllBlock')) {
+      log('⚠️ 監控初始化：抽出的網址不含 AllBlock（網站可能已改版）'); return null;
+    }
+    if (!/SessionId=[^&]+/i.test(url)) {
+      log('⚠️ 監控初始化：抽出的網址缺少 SessionId，放棄啟用監控（避免打空請求）'); return null;
     }
 
-    let playSeq = '';
-    try { playSeq = win.document.getElementById('PlaySeq')?.value || ''; } catch (_) {}
-    if (!playSeq) { log('⚠️ 監控初始化：抓不到 PlaySeq（場次序號）'); return null; }
-
-    const path = raw.slice(0, qIdx);
-    const baseParams = new URLSearchParams(raw.slice(qIdx + 1));
-    baseParams.set('PlaySeq', playSeq);
-    return () => path + '?' + baseParams.toString();
+    // 核對用：印出網址但遮罩 SessionId，避免完整 token 落在 log
+    log(`🛰️ 監控 API 就緒：${url.replace(/(SessionId=)([^&]{0,8})[^&]*/i, '$1$2…')}`);
+    return () => url;
   } catch (e) {
     log(`⚠️ 監控初始化失敗: ${e.message}`);
     return null;
