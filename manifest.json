@@ -12,7 +12,8 @@
   ],
   "host_permissions": [
     "https://gpoticket.globalinterpark.com/*",
-    "https://tickets.interpark.com/*"
+    "https://tickets.interpark.com/*",
+    "http://127.0.0.1:8793/*"
   ],
   "background": {
     "service_worker": "background.js"

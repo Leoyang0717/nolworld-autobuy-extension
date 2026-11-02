@@ -35,32 +35,148 @@ let watchObserver = null;
 
 let seatMapObserver = null;
 let seatMapTriggered = false;
-let seatMapHeartbeat = null;
+// Every timeout/interval the seat map watch schedules lives here, so a stop
+// (manual, timeout or success) cancels pending retries instead of letting them restart the watch
+const seatMapTimers = new Set();
+let seatMapRows = [];       // target rows for the current watch session
+let seatMapTimeoutMin = 0;  // user-set limit, kept across internal re-watches
+let seatMapDeadline = 0;    // absolute ms timestamp; 0 = no limit
+let seatMapStartTs = 0;
+const SEATMAP_SUBMIT_WAIT_TICKS = 60;      // x 100ms waiting for Submit to unlock
+const SEATMAP_RESULT_TIMEOUT_MS = 8000;    // after select API fires, wait this long for a result
 const rejectedSeats = new Set(); // 被伺服器 reject 的座位，暫時跳過
 let selectApiCalled = false;
 let origFetch = null;
 let origXhrOpen = null;
+
+// ─── seatStatus 被動監聽（只讀頁面自己打的 API，不額外發請求）──
+// 頁面約每 3 秒打 /onestop/api/seatStatus?blockKeys=...（每次最多 16 區，區多就分多發），
+// 回應 data[i] 對應 blockKeys[i]，是 hex 點陣：每個 bit 依 DOM 順序對應一個座位，1＝可選
+let seatStatusMap = {};       // block key -> open count (latest)
+let seatStatusUpdates = 0;    // responses parsed in the current watch session
+let seatStatusLastTs = 0;
+// Render-lag probe: block key -> { apiTs, expected } waiting for the DOM to show what the API said
+const renderLagPending = new Map();
+const RENDER_LAG_GIVEUP_MS = 5000;
+const blockChangeTs = {};     // block key -> when the API last reported more open seats
+
+const HEX_POPCOUNT = [0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4];
+function countOpenBits(hex) {
+  let n = 0;
+  for (const ch of hex) n += HEX_POPCOUNT[parseInt(ch, 16)] || 0;
+  return n;
+}
+
+// "001:212" -> "212", "001:003" -> "F3" (two-digit-or-less codes are floor blocks on these maps)
+function blockLabel(key) {
+  const tail = String(key).split(':').pop();
+  const n = parseInt(tail, 10);
+  return Number.isFinite(n) && n < 100 ? `F${n}` : tail;
+}
+
+function handleSeatStatus(url, json) {
+  let keys;
+  try { keys = new URL(url, location.href).searchParams.getAll('blockKeys'); } catch (_) { return; }
+  const data = json?.data;
+  if (!keys.length || !Array.isArray(data) || data.length !== keys.length) return;
+  seatStatusUpdates++;
+  seatStatusLastTs = Date.now();
+
+  const changes = [];
+  const apiTs = Date.now();
+  keys.forEach((key, i) => {
+    const open = typeof data[i] === 'string' ? countOpenBits(data[i]) : 0;
+    const prev = seatStatusMap[key];
+    seatStatusMap[key] = open;
+    if (prev !== undefined && prev !== open) {
+      if (open > prev) blockChangeTs[key] = apiTs;
+      if (document.getElementById(`seat_block_${key}`)) renderLagPending.set(key, { apiTs, expected: open, prev });
+    }
+    // First sighting only reports blocks that already have seats; later ones report any change
+    if (prev === undefined ? open > 0 : prev !== open) changes.push({ key, prev: prev ?? null, open });
+  });
+  trace('seat_status_resp', { blocks: keys.length, changed: changes.length });
+  // The page renders after our load listener runs, so check on the next frames too
+  checkRenderLag();
+  if (!changes.length) return;
+
+  const targeted = (key) => !seatMapRows.length || seatMapRows.includes(key);
+  const text = changes.map(c =>
+    `${blockLabel(c.key)} ${c.prev === null ? '' : `${c.prev}→`}${c.open}${targeted(c.key) ? '〔指定〕' : '〔未指定〕'}`
+  ).join('、');
+  log(`🎫 座位變化：${text}`, {
+    event: 'seat_status',
+    changes: changes.map(c => ({ ...c, label: blockLabel(c.key), targeted: targeted(c.key) })),
+  });
+  window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'SEATMAP_COUNTS', counts: { ...seatStatusMap } } }, '*');
+}
+
+function countDomOpen(key) {
+  const g = document.getElementById(`seat_block_${key}`);
+  if (!g) return null;
+  let n = 0;
+  g.querySelectorAll('circle.js-seat').forEach(c => {
+    const cls = c.getAttribute('class') || '';
+    if (!cls.includes('SeatMap_disabled__')) n++;
+  });
+  return n;
+}
+
+// Called after each API response and on every DOM mutation while watching
+function checkRenderLag() {
+  if (!renderLagPending.size) return;
+  const now = Date.now();
+  for (const [key, p] of renderLagPending) {
+    const dom = countDomOpen(key);
+    if (dom === p.expected) {
+      renderLagPending.delete(key);
+      trace('render_lag', { key, label: blockLabel(key), lagMs: now - p.apiTs, prev: p.prev, open: p.expected });
+    } else if (now - p.apiTs > RENDER_LAG_GIVEUP_MS) {
+      renderLagPending.delete(key);
+      trace('render_lag', { key, label: blockLabel(key), lagMs: null, prev: p.prev, open: p.expected, dom, note: 'dom never matched' });
+    }
+  }
+}
+
+function openBlocksSummary() {
+  const open = Object.entries(seatStatusMap).filter(([, n]) => n > 0);
+  if (!open.length) return '全部無位';
+  return open.map(([k, n]) => `${blockLabel(k)}×${n}${!seatMapRows.length || seatMapRows.includes(k) ? '' : '〔未指定〕'}`).join('、');
+}
 
 function hookFetch() {
   // Fetch API
   if (!origFetch) {
     origFetch = window.fetch;
     window.fetch = async function(...args) {
-      const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
+      const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || String(args[0] || ''));
       if (url.includes('/api/seats/select')) {
         selectApiCalled = true;
         log(`[API] seats/select (fetch) 已發出`);
       }
-      return origFetch.apply(this, args);
+      const res = await origFetch.apply(this, args);
+      if (url.includes('/onestop/api/seatStatus')) {
+        res.clone().json().then(j => handleSeatStatus(url, j)).catch(() => {});
+      }
+      return res;
     };
   }
   // XMLHttpRequest（站台實際使用 XHR）
   if (!origXhrOpen) {
     origXhrOpen = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function(method, url, ...rest) {
-      if (typeof url === 'string' && url.includes('/api/seats/select')) {
+      const u = String(url || '');
+      if (u.includes('/api/seats/select')) {
         selectApiCalled = true;
         log(`[API] seats/select (XHR) 已發出`);
+      }
+      if (u.includes('/onestop/api/seatStatus')) {
+        this.addEventListener('load', () => {
+          try {
+            const j = this.responseType === 'json' ? this.response : JSON.parse(this.responseText);
+            handleSeatStatus(u, j);
+          } catch (_) {}
+        }, { once: true });
       }
       return origXhrOpen.apply(this, [method, url, ...rest]);
     };
@@ -74,11 +190,21 @@ function unhookFetch() {
 }
 
 // ─── 工具 ────────────────────────────────────────────────
-function log(msg) {
+// Groups every log line of one start/watch session, so a run can be pulled out of the day's file
+let logRunId = null;
+
+// data: optional structured fields, written to the log file only (not shown in the panel)
+function log(msg, data) {
   const time = new Date().toLocaleTimeString('zh-TW', { hour12: false });
   const text = `[${time}] ${msg}`;
   console.log('[NOL搶票]', text);
-  window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'LOG', message: text } }, '*');
+  // ts is taken here, not in the service worker: the worker may be asleep and stamp a whole backlog at once
+  window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'LOG', message: text, data: { ts: Date.now(), run: logRunId, ...data } } }, '*');
+}
+
+// File-only record for high-frequency events (every request/response) that would flood the panel
+function trace(event, data) {
+  window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'TRACE', data: { ts: Date.now(), run: logRunId, event, ...data } } }, '*');
 }
 
 function randomInterval() {
@@ -134,12 +260,165 @@ function watchReserveBtn() {
 }
 
 // ─── 座位圖監聽（React SVG 架構）──────────────────────────
+function smTimeout(fn, ms) {
+  const id = setTimeout(() => { seatMapTimers.delete(id); fn(); }, ms);
+  seatMapTimers.add(id);
+  return id;
+}
+
+function smInterval(fn, ms) {
+  const id = setInterval(fn, ms);
+  seatMapTimers.add(id);
+  return id;
+}
+
+// clearTimeout also cancels intervals (browsers share one timer list)
+function smClear(id) {
+  clearTimeout(id);
+  seatMapTimers.delete(id);
+}
+
 function stopWatchSeatMap() {
-  if (seatMapObserver)  { seatMapObserver.disconnect(); seatMapObserver = null; }
-  if (seatMapHeartbeat) { clearInterval(seatMapHeartbeat); seatMapHeartbeat = null; }
+  if (seatMapObserver) { seatMapObserver.disconnect(); seatMapObserver = null; }
+  renderLagPending.clear(); // no observer = no valid render timing; drop instead of mis-measuring later
+  seatMapTimers.forEach(id => clearTimeout(id));
+  seatMapTimers.clear();
   unhookFetch();
   // 注意：不在這裡 reset seatMapTriggered
   // triggerSeat 呼叫時需保持 true 防止重複觸發
+}
+
+// ─── 彈窗記錄器（只記錄、不處理）─────────────────────────
+// Runs for the whole watch session (independent of stopWatchSeatMap, which triggerSeat calls internally)
+// so we can collect the real modal texts before writing handling rules.
+// MutationObserver callbacks run as microtasks, i.e. before checkStolenModal's interval can close the modal.
+let modalObserver = null;
+let modalStopTimer = null;
+const modalsOpen = new Map(); // signature -> { types, text, shownAt }
+// The site mixes two UI kits: CSS-module "Modal*" components (e.g. ModalToast) and the
+// "nds-e-dialog" design system (e.g. seat time expired); ARIA roles catch both and any future one
+const MODAL_SELECTOR = '[class*="Modal"], [role="dialog"], [role="alertdialog"], [aria-modal="true"]';
+let seatMapLastTriggerTs = 0;
+let seatMapLastSeatId = null;
+
+function readModal(root) {
+  const types = new Set();
+  const role = root.getAttribute('role');
+  if (role === 'dialog' || role === 'alertdialog') types.add(`role:${role}`);
+  const kit = (root.getAttribute('class') || '').match(/\b(nds-[a-z]-[a-z-]+?)__/);
+  if (kit) types.add(kit[1]);
+  [root, ...root.querySelectorAll('[class*="Modal"]')].forEach(el => {
+    const cls = el.getAttribute('class') || '';
+    for (const m of cls.matchAll(/\b(Modal[A-Za-z]+)_/g)) types.add(m[1]);
+  });
+  return {
+    types: [...types],
+    text: (root.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 500),
+    dialogMessage: document.getElementById('dialogMessage')?.textContent?.trim() || null,
+    buttons: [...root.querySelectorAll('button')].map(b => b.textContent.trim()).filter(Boolean),
+    html: root.outerHTML.slice(0, 4000),
+  };
+}
+
+// ─── 彈窗分類（依實際收集到的原文；見 log 的 modal_shown）──────
+// Seen so far: "This seat has already been reserved." / "Your 10-minute seat selection time has expired."
+// / "Would you like to re-select your seats? ..." (shown when the user clicks the map after booking)
+function classifyDialog(text) {
+  if (/already been reserved|already (been )?(selected|sold|taken)|not available/i.test(text)) return 'TAKEN';
+  if (/has expired|restart your booking/i.test(text)) return 'EXPIRED';
+  if (/re-?select your seats/i.test(text)) return 'RESELECT';
+  return 'UNKNOWN';
+}
+
+// The blocking dialog on screen from either UI kit (toasts have no buttons and are ignored)
+function findBlockingDialog() {
+  const legacy = document.querySelector('[class*="ModalConfirm_button__"]');
+  if (legacy && legacy.getClientRects().length) {
+    return { text: document.getElementById('dialogMessage')?.textContent?.trim() || '', buttons: [legacy] };
+  }
+  for (const d of document.querySelectorAll('[role="dialog"], [role="alertdialog"]')) {
+    const buttons = [...d.querySelectorAll('button')];
+    if (!buttons.length || !d.getClientRects().length) continue;
+    return { text: (d.innerText || '').replace(/\s+/g, ' ').trim(), buttons };
+  }
+  return null;
+}
+
+// React buttons need their own onClick; a plain .click() may not reach the handler
+function pressReactButton(btn) {
+  const reactKey = Object.keys(btn).find(k => k.startsWith('__reactProps'));
+  if (reactKey && btn[reactKey]?.onClick) {
+    btn[reactKey].onClick({ type: 'click', target: btn, currentTarget: btn, bubbles: true, cancelable: true, preventDefault: () => {}, stopPropagation: () => {} });
+  } else {
+    btn.click();
+  }
+}
+
+// Longer than one seatStatus poll (~3.9s): the map keeps showing a taken seat as open until the next poll
+const SEAT_REJECT_MS = 10000;
+function rejectSeat(id) {
+  rejectedSeats.add(id);
+  setTimeout(() => rejectedSeats.delete(id), SEAT_REJECT_MS);
+}
+
+function scanModals() {
+  // Outermost visible Modal* elements only (nested Modal* parts belong to the same dialog)
+  const roots = [...document.querySelectorAll(MODAL_SELECTOR)].filter(el =>
+    !el.parentElement?.closest(MODAL_SELECTOR) && el.getClientRects().length && (el.innerText || '').trim()
+  );
+  const seen = new Set();
+  const now = Date.now();
+  const phase = seatMapTriggered ? 'after_click' : 'watching';
+  for (const root of roots) {
+    const m = readModal(root);
+    // Digits normalized so a ticking countdown inside a dialog doesn't log it again every second
+    const sig = `${m.types.join('+')}|${m.text.replace(/\d+/g, '#')}`;
+    seen.add(sig);
+    if (modalsOpen.has(sig)) continue;
+    modalsOpen.set(sig, { types: m.types, text: m.text, shownAt: now });
+    log(`🪟 彈窗出現〔${m.types.join(' / ') || '?'}〕：「${m.text}」${m.buttons.length ? ` 按鈕：[${m.buttons.join(', ')}]` : ''}`, {
+      event: 'modal_shown', phase, ...m,
+      seatId: phase === 'after_click' ? seatMapLastSeatId : null,
+      sinceTriggerMs: phase === 'after_click' ? now - seatMapLastTriggerTs : null,
+    });
+    // Session over: watching on is pointless (timers exist only while a watch is live)
+    if (seatMapTimers.size && m.buttons.length && classifyDialog(m.text) === 'EXPIRED') {
+      endSeatMap('EXPIRED', '⏰ 選位時間已到，已停止監聽，請重新進入選座頁');
+      return;
+    }
+  }
+  for (const [sig, m] of modalsOpen) {
+    if (seen.has(sig)) continue;
+    modalsOpen.delete(sig);
+    trace('modal_closed', { types: m.types, text: m.text, visibleMs: now - m.shownAt });
+  }
+}
+
+function startModalRecorder() {
+  stopModalRecorder();
+  scanModals(); // record anything already on screen
+  modalObserver = new MutationObserver(scanModals);
+  modalObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
+}
+
+function stopModalRecorder(delayMs = 0) {
+  if (modalStopTimer) { clearTimeout(modalStopTimer); modalStopTimer = null; }
+  if (delayMs > 0) { modalStopTimer = setTimeout(() => stopModalRecorder(), delayMs); return; }
+  if (modalObserver) { modalObserver.disconnect(); modalObserver = null; }
+  modalsOpen.clear();
+}
+
+// End the watch for good and tell the side panel so its buttons/status reset
+function endSeatMap(reason, msg) {
+  log(msg, { event: 'seatmap_stop', reason });
+  stopWatchSeatMap();
+  stopModalRecorder();
+  window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'SEATMAP_STOPPED', reason } }, '*');
+}
+
+function rewatchSeatMap(msg) {
+  log(msg);
+  smTimeout(watchSeatMap, 500);
 }
 
 function findSubmitBtn() {
@@ -161,15 +440,56 @@ function logSubmitState() {
   log('[Submit] 找不到 Submit 按鈕');
 }
 
+function isSelectPriceShown() {
+  return [...document.querySelectorAll('h2')].some(h => h.textContent.trim() === 'Select Price');
+}
+
 function isSeatAvailable(circle) {
   if (rejectedSeats.has(circle.id)) return false;
   const cls = circle.className?.baseVal || circle.getAttribute('class') || '';
-  return cls.includes('js-seat') && !cls.includes('SeatMap_disabled__');
+  // Skip seats we already selected: clicking them again would deselect
+  return cls.includes('js-seat') && !cls.includes('SeatMap_disabled__') && !cls.includes('SeatMap_selected__');
 }
 
-function watchSeatMap(targetRows, timeoutMin = 0) {
+// List every seat block currently drawn on the map (only present once zoomed in to seat level)
+function scanSeatBlocks() {
+  return [...document.querySelectorAll('svg g[id^="seat_block_"]')].map(g => {
+    const seats = g.querySelectorAll('circle.js-seat');
+    let open = 0;
+    seats.forEach(c => { if (isSeatAvailable(c)) open++; });
+    const key = g.id.slice('seat_block_'.length);
+    return { key, label: blockLabel(key), total: seats.length, open };
+  });
+}
+
+// Entry point from the side panel; internal re-watches call watchSeatMap() directly
+// so the rows and the overall deadline survive retries
+function startWatchSeatMap(rows, timeoutMin) {
+  seatMapRows = rows || [];
+  seatMapTimeoutMin = timeoutMin || 0;
+  seatMapStartTs = Date.now();
+  seatMapDeadline = seatMapTimeoutMin > 0 ? seatMapStartTs + seatMapTimeoutMin * 60000 : 0;
+  rejectedSeats.clear();
+  seatStatusMap = {};
+  seatStatusUpdates = 0;
+  seatStatusLastTs = 0;
+  renderLagPending.clear();
+  logRunId = `seatmap-${seatMapStartTs}`;
+  startModalRecorder();
+  if (seatMapTimeoutMin > 0) {
+    log(`⏱️ 監聽時限：${seatMapTimeoutMin} 分鐘（${seatMapTimeoutMin * 60}s）`);
+  }
+  return watchSeatMap();
+}
+
+function watchSeatMap() {
   stopWatchSeatMap();
   seatMapTriggered = false; // 重新開始監聽時才 reset
+
+  if (seatMapDeadline && Date.now() >= seatMapDeadline) {
+    handleSeatMapTimeout();
+    return false;
+  }
 
   // 監聽穩定的高層容器，避免 React re-mount 導致參照失效
   const observeRoot = document.querySelector('.SeatMap_seatMap__3ktuQ')
@@ -177,44 +497,92 @@ function watchSeatMap(targetRows, timeoutMin = 0) {
     || document.body;
 
   if (!document.querySelector('svg')) {
-    log('⚠️ 找不到 SVG 座位圖（確認在選座頁面）');
-    return;
-  }
-
-  hookFetch();
-  selectApiCalled = false;
-  const desc = targetRows?.length ? `row [${targetRows.join(', ')}]` : '全場';
-  log(`🕐 座位圖監聽中：${desc}`);
-
-  function checkStolenModal(circleId) {
-    // 只要出現 Confirm 按鈕就處理，不管 modal 文字內容
-    const confirmBtn = document.querySelector('.ModalConfirm_button__qDjC3');
-    if (confirmBtn) {
-      const msg = document.getElementById('dialogMessage');
-      const text = msg?.textContent?.trim() || '(未知錯誤)';
-      // React 按鈕需用 __reactProps.onClick，否則 .click() 無效
-      const reactKey = Object.keys(confirmBtn).find(k => k.startsWith('__reactProps'));
-      if (reactKey && confirmBtn[reactKey]?.onClick) {
-        confirmBtn[reactKey].onClick({ type: 'click', target: confirmBtn, currentTarget: confirmBtn, bubbles: true, cancelable: true, preventDefault: () => {}, stopPropagation: () => {} });
-      } else {
-        confirmBtn.click();
-      }
-      rejectedSeats.add(circleId);
-      log(`⚠️ Modal：「${text}」，加入黑名單，重新監聽...`);
-      setTimeout(() => { rejectedSeats.delete(circleId); }, 3000);
-      setTimeout(() => watchSeatMap(targetRows), 500);
-      return true;
-    }
+    endSeatMap('NO_SVG', '⚠️ 找不到 SVG 座位圖（確認在選座頁面）');
     return false;
   }
 
-  function triggerSeat(circle) {
+  const targetRows = seatMapRows;
+  let triggerTs = 0;
+  const leftover = findBlockingDialog();
+  if (leftover && classifyDialog(leftover.text) === 'TAKEN') {
+    pressReactButton(leftover.buttons.find(b => /^(ok|confirm|확인)$/i.test(b.textContent.trim())) || leftover.buttons[0]);
+    log(`關閉殘留彈窗：「${leftover.text}」`);
+  }
+  hookFetch();
+  selectApiCalled = false;
+  const desc = targetRows.length ? `[${targetRows.map(blockLabel).join(', ')}]` : '全場';
+  log(`🕐 座位圖監聽中：${desc}`, { event: 'seatmap_watch', rows: targetRows });
+  const missing = targetRows.filter(r => !document.getElementById(`seat_block_${r}`));
+  if (missing.length) {
+    log(`⚠️ 頁面上目前找不到 ${missing.map(blockLabel).join(', ')}（若停在純圖模式，請先放大到座位格子）`);
+  }
+
+  function handleSeatMapTimeout() {
+    log(`⏱️ 監聽已達 ${seatMapTimeoutMin} 分鐘時限，自動停止`, { event: 'seatmap_stop', reason: 'TIMEOUT' });
+    stopWatchSeatMap();
+    stopModalRecorder();
+    window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'SEATMAP_TIMEOUT', minutes: seatMapTimeoutMin } }, '*');
+  }
+
+  // Returns true when a dialog was handled (caller stops its current loop)
+  function checkStolenModal(circleId) {
+    const dlg = findBlockingDialog();
+    if (!dlg) return false;
+    const kind = classifyDialog(dlg.text);
+    if (kind === 'RESELECT') return false; // user-triggered; pressing Re-select would release a booked seat
+    if (kind === 'TAKEN') {
+      const ok = dlg.buttons.find(b => /^(ok|confirm|확인)$/i.test(b.textContent.trim())) || dlg.buttons[0];
+      pressReactButton(ok);
+      rejectSeat(circleId);
+      log(`⚠️ 座位已被搶走：「${dlg.text}」，${SEAT_REJECT_MS / 1000} 秒內跳過此座位`, {
+        event: 'seat_rejected', seatId: circleId, modal: dlg.text, sinceTriggerMs: Date.now() - triggerTs,
+      });
+      rewatchSeatMap('換下一個座位，重新監聽...');
+      return true;
+    }
+    // Expired or never-seen wording: stop instead of looping on something we don't understand
+    if (kind === 'EXPIRED') endSeatMap('EXPIRED', '⏰ 選位時間已到，已停止監聽，請重新進入選座頁');
+    else endSeatMap('UNKNOWN_DIALOG', `⚠️ 出現未知彈窗「${dlg.text}」，已停止監聽，請手動處理`);
+    return true;
+  }
+
+  // Success is only declared once the price step is actually on screen
+  function onSeatMapSuccess(circleId) {
+    log('✅ Select Price 已出現，Submit 成功！', { event: 'seatmap_success', seatId: circleId, sinceTriggerMs: Date.now() - triggerTs });
+    stopWatchSeatMap();
+    stopModalRecorder(60000); // keep recording dialogs on the price step for a minute
+    window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'SEATMAP_FOUND', id: circleId } }, '*');
+  }
+
+  // After the select API fires, keep watching for its outcome instead of going silent
+  function waitSelectResult(circleId) {
+    const t0 = Date.now();
+    const t3 = smInterval(() => {
+      if (checkStolenModal(circleId)) { smClear(t3); return; }
+      if (isSelectPriceShown()) { smClear(t3); onSeatMapSuccess(circleId); return; }
+      if (Date.now() - t0 > SEATMAP_RESULT_TIMEOUT_MS) {
+        smClear(t3);
+        endSeatMap('RESULT_TIMEOUT', `⚠️ select API 送出 ${SEATMAP_RESULT_TIMEOUT_MS / 1000}s 仍未看到結果，已停止監聽，請手動確認頁面`);
+      }
+    }, 150);
+  }
+
+  function triggerSeat(circle, candidates = 1) {
     if (seatMapTriggered) return;
     seatMapTriggered = true;
+    triggerTs = Date.now();
+    seatMapLastTriggerTs = triggerTs;
+    seatMapLastSeatId = circle.id;
     stopWatchSeatMap(); // 斷開 observer，但也會 unhookFetch
     selectApiCalled = false;
     hookFetch();        // 重新掛，用於偵測 select API 發出後停止 Submit 循環
-    log(`🚀 [1] 座位解鎖：${circle.id}`);
+    const blockKey = circle.closest('g[id^="seat_block_"]')?.id.slice('seat_block_'.length) || null;
+    const apiTs = blockKey ? blockChangeTs[blockKey] : null;
+    log(`🚀 [1] 座位解鎖：${circle.id}`, {
+      event: 'seat_trigger', seatId: circle.id, block: blockKey, candidates,
+      // How long after the API reported this block opening did our DOM-based trigger fire
+      apiToTriggerMs: apiTs ? triggerTs - apiTs : null,
+    });
 
     // 步驟1：點擊座位
     const circleReactKey = Object.keys(circle).find(k => k.startsWith('__reactProps'));
@@ -233,13 +601,13 @@ function watchSeatMap(targetRows, timeoutMin = 0) {
 
     // 步驟2：等 Submit 解鎖
     let attempts = 0;
-    const t = setInterval(() => {
-      if (checkStolenModal(circle.id)) { clearInterval(t); return; }
+    const t = smInterval(() => {
+      if (checkStolenModal(circle.id)) { smClear(t); return; }
       const btn = findSubmitBtn();
       if (btn) {
-        clearInterval(t);
-        log(`[3] Submit 解鎖（等了 ${attempts * 100}ms），開始反覆按直到成功...`);
-        window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'SEATMAP_FOUND', id: circle.id } }, '*');
+        smClear(t);
+        const waitMs = Date.now() - triggerTs;
+        log(`[3] Submit 解鎖（等了 ${waitMs}ms），開始反覆按直到成功...`, { event: 'submit_unlocked', waitMs });
 
         function clickSubmit(b) {
           const reactKey = Object.keys(b).find(k => k.startsWith('__reactProps'));
@@ -258,41 +626,48 @@ function watchSeatMap(targetRows, timeoutMin = 0) {
           }
         }
 
-        // 每 200ms 按一次，直到 PriceContent 出現（成功）或逾時
+        // 每 150ms 按一次，直到 Select Price 出現（成功）、select API 發出或逾時
         let submitCount = 0;
-        const t2 = setInterval(() => {
-          if (checkStolenModal(circle.id)) { clearInterval(t2); return; }
-          if ([...document.querySelectorAll('h2')].some(h => h.textContent.trim() === 'Select Price')) {
-            clearInterval(t2);
-            log('✅ Select Price 已出現，Submit 成功！');
+        const t2 = smInterval(() => {
+          if (checkStolenModal(circle.id)) { smClear(t2); return; }
+          if (isSelectPriceShown()) { smClear(t2); onSeatMapSuccess(circle.id); return; }
+          // select API 已發出 → 停止按，改為等待結果
+          if (selectApiCalled) {
+            smClear(t2);
+            log('[4] select API 已發出，等待結果...', { event: 'select_api_sent', submitClicks: submitCount, sinceTriggerMs: Date.now() - triggerTs });
+            waitSelectResult(circle.id);
             return;
           }
           const freshBtn = findSubmitBtn();
-          // select API 已發出 → 停止按，等結果
-          if (selectApiCalled) {
-            clearInterval(t2);
-            log('[4] select API 已發出，等待結果...');
-            return;
-          }
           if (freshBtn) {
             log(`[4] Submit #${submitCount + 1}：disabled=${freshBtn.disabled} parent="${freshBtn.parentElement?.className}"`);
             clickSubmit(freshBtn);
           } else {
-            clearInterval(t2);
-            log('⚠️ Submit 按鈕消失，重新監聽...');
-            setTimeout(() => watchSeatMap(targetRows), 500);
+            // Usually the site rejected the seat right after the click; its dialog follows ~100ms later.
+            // Wait for it and let checkStolenModal close it, or the next seat would get blamed for it
+            smClear(t2);
+            rejectSeat(circle.id);
+            const goneAt = Date.now();
+            const t4 = smInterval(() => {
+              if (checkStolenModal(circle.id)) { smClear(t4); return; }
+              if (Date.now() - goneAt > 600) {
+                smClear(t4);
+                rewatchSeatMap('⚠️ Submit 按鈕消失，跳過此座位，重新監聽...');
+              }
+            }, 50);
             return;
           }
           if (++submitCount > 20) {
-            clearInterval(t2);
-            log('⚠️ Submit 反覆按仍未發出 select API，重新監聽...');
-            setTimeout(() => watchSeatMap(targetRows), 500);
+            smClear(t2);
+            rejectSeat(circle.id);
+            rewatchSeatMap('⚠️ Submit 反覆按仍未發出 select API，跳過此座位，重新監聽...');
           }
         }, 150);
-      } else if (++attempts > 60) {
-        clearInterval(t);
+      } else if (++attempts > SEATMAP_SUBMIT_WAIT_TICKS) {
+        smClear(t);
         logSubmitState();
-        log('[3] ⚠️ Submit 等待逾時（3s），請手動點擊');
+        // The seat may be half-selected; re-watching could stack a second seat, so hand back to the user
+        endSeatMap('SUBMIT_TIMEOUT', `[3] ⚠️ Submit 等待逾時（${SEATMAP_SUBMIT_WAIT_TICKS / 10}s），已停止監聽，請手動確認頁面`);
       }
     }, 100);
   }
@@ -300,45 +675,41 @@ function watchSeatMap(targetRows, timeoutMin = 0) {
   // 每次都重新查詢 DOM，不依賴舊參照
   function scanTargets() {
     if (seatMapTriggered) return;
-    const elements = targetRows?.length
+    const elements = targetRows.length
       ? targetRows.map(r => document.getElementById(`seat_block_${r}`)).filter(Boolean)
       : [document.querySelector('svg')].filter(Boolean);
 
+    // Random pick: other bots likely take the first open seat in DOM order, so avoid colliding with them
+    const open = [];
     for (const el of elements) {
       for (const circle of el.querySelectorAll('circle.js-seat')) {
-        if (isSeatAvailable(circle)) { triggerSeat(circle); return; }
+        if (isSeatAvailable(circle)) open.push(circle);
       }
     }
+    if (open.length) triggerSeat(open[Math.floor(Math.random() * open.length)], open.length);
   }
 
   // 先掃描現有可用座位
   scanTargets();
-  if (seatMapTriggered) return;
+  if (seatMapTriggered) return true;
 
-  // 每 30 秒 heartbeat + 逾時檢查
-  let heartbeatCount = 0;
-  const timeoutSec = timeoutMin * 60;
-  if (timeoutMin > 0) {
-    log(`⏱️ 監聽時限：${timeoutMin} 分鐘（${timeoutSec}s）`);
-  }
-  seatMapHeartbeat = setInterval(() => {
-    heartbeatCount++;
-    const elapsed = heartbeatCount * 30;
-    if (timeoutSec > 0 && elapsed >= timeoutSec) {
-      log(`⏱️ 監聽已達 ${timeoutMin} 分鐘時限，自動停止`);
-      stopWatchSeatMap();
-      window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'SEATMAP_TIMEOUT', minutes: timeoutMin } }, '*');
-      return;
-    }
-    log(`👁️ 座位圖監聽中（${elapsed}s）...等待位置解鎖`);
+  // 每 30 秒 heartbeat + 逾時檢查（時限從使用者按下開始算，重新監聽不會重置）
+  smInterval(() => {
+    if (seatMapDeadline && Date.now() >= seatMapDeadline) { handleSeatMapTimeout(); return; }
+    const elapsed = Math.round((Date.now() - seatMapStartTs) / 1000);
+    // No seatStatus for 15s+ means the page stopped polling (usually still in the zoomed-out overview)
+    const stale = !seatStatusLastTs || Date.now() - seatStatusLastTs > 15000;
+    log(stale
+      ? `👁️ 監聽中（${elapsed}s）⚠️ 頁面沒有在更新座位（seatStatus 已停），請把座位圖放大到看得到座位格子`
+      : `👁️ 監聽中（${elapsed}s）· 座位 API 已更新 ${seatStatusUpdates} 次 · 有位：${openBlocksSummary()}`,
+      { event: 'seatmap_heartbeat', elapsed, updates: seatStatusUpdates, stale, counts: { ...seatStatusMap } });
   }, 30000);
 
   // 監聽高層容器，捕捉任何 DOM 變化（attribute 修改 or React 整體替換）
-  let mutationCount = 0;
+  // DOM 變化不再逐筆 log（hover/縮放也會觸發，是雜訊）；實際座位變化由 seatStatus 回報
   seatMapObserver = new MutationObserver(() => {
+    checkRenderLag();
     if (seatMapTriggered) return;
-    mutationCount++;
-    log(`[DOM] 變化 #${mutationCount}，掃描中...`);
     scanTargets();
   });
 
@@ -348,6 +719,7 @@ function watchSeatMap(targetRows, timeoutMin = 0) {
     attributeFilter: ['class', 'fill'],
     childList: true,
   });
+  return true;
 }
 
 // ─── 遞迴搜尋所有 iframe（含巢狀）找 fnBlockSeatUpdate ──
@@ -657,6 +1029,7 @@ function waitForSeatLoad(timeout = 1500) {
 
 // ─── 驗證碼停止（共用）──────────────────────────────────
 function handleCaptchaStop(where) {
+  trace('captcha', { source: where, action: 'stop', sinceStartMs: Date.now() - startTime, attempts: zoneIndex });
   log(`🔒 偵測到驗證碼（${where}）！停止搶票，請完成驗證後重新開始`);
   window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'CAPTCHA' } }, '*');
   stop('CAPTCHA');
@@ -665,6 +1038,11 @@ function handleCaptchaStop(where) {
 // ─── Access Denied 暫停/停止（盲輪與偵察共用）────────────
 function handleDeniedPause() {
   deniedStreak++;
+  trace('access_denied', {
+    streak: deniedStreak, sinceStartMs: Date.now() - startTime,
+    mode: cycleFn === scoutTick ? 'scout' : 'blind',
+    attempts: cycleFn === scoutTick ? scoutReqCount : zoneIndex,
+  });
   if (deniedStreak >= 4) {
     log(`⛔ Access Denied 連續 ${deniedStreak - 1} 次等待後仍被擋，11 秒策略已失效，停止搶票`);
     window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'ACCESS_DENIED_FATAL', count: deniedStreak } }, '*');
@@ -681,12 +1059,15 @@ function handleDeniedPause() {
 }
 
 // ─── 進入區域並嘗試選位（盲輪與偵察共用）─────────────────
+let lastSeatLoadMs = null; // iframe load time of the latest zone entry (for tracing)
 // 回傳 'FOUND' | 'DENIED' | 'CAPTCHA' | 'NONE' | 'FAIL'
 async function enterZoneAndPick(zoneCode) {
   const clicked = clickZone(zoneCode);
   if (!clicked) { log(`${zoneCode} 點擊失敗`); return 'FAIL'; }
 
+  const loadStart = Date.now();
   await waitForSeatLoad();
+  lastSeatLoadMs = Date.now() - loadStart;
 
   // Denied/驗證碼須在載入完成後檢查：舊畫面會殘留在 iframe 內，
   // 點擊前檢查會把殘留畫面誤計成新的一次
@@ -741,6 +1122,7 @@ async function runCycle() {
 
   log(`嘗試 ${zoneCode} 區域（第 ${zoneIndex} 次）${monitorOverride ? '🎯監控鎖定' : ''}`);
   const res = await enterZoneAndPick(zoneCode);
+  trace('blind_try', { zone: zoneCode, attempt: zoneIndex, result: res, loadMs: lastSeatLoadMs, monitorLocked: !!monitorOverride });
   if (res === 'FOUND') return;
   if (res === 'DENIED')  { handleDeniedPause(); return; }
   if (res === 'CAPTCHA') { handleCaptchaStop('選位頁'); return; }
@@ -791,7 +1173,10 @@ function findWinWithNamedFn(doc, name, depth) {
 function pauseForCaptcha(source, responseText) {
   if (timer) { clearTimeout(timer); timer = null; }
   scoutBusy = true;
-  log(`🔒 偵測到驗證要求（${source}），暫停偵察（持續時間照常計算）`);
+  const pausedAt = Date.now();
+  log(`🔒 偵測到驗證要求（${source}），暫停偵察（持續時間照常計算）`, {
+    event: 'captcha', source, action: 'pause', sinceStartMs: pausedAt - startTime, attempts: scoutReqCount,
+  });
   window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'CAPTCHA_PAUSE' } }, '*');
 
   let opened = false;
@@ -817,7 +1202,7 @@ function pauseForCaptcha(source, responseText) {
     if (findCaptchaInDoc(document, 0)) { seen = true; return; }
     if (seen) {
       clearInterval(poll);
-      log('✅ 驗證完成，恢復偵察');
+      log('✅ 驗證完成，恢復偵察', { event: 'captcha_resumed', pausedMs: Date.now() - pausedAt });
       window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'CAPTCHA_RESUMED' } }, '*');
       scoutConsecAnomaly = 0;
       cycleFn(); // scoutTick 開頭會解除 scoutBusy
@@ -920,16 +1305,20 @@ async function scoutStrike(zone, n, html) {
   scoutBusy = true;
   deniedStreak = 0;
   scoutConsecAnomaly = 0;
-  log(`🎯 偵察命中：${zone} 區有 ${n} 個可選座位，開衝！`);
+  const strikeAt = Date.now();
+  log(`🎯 偵察命中：${zone} 區有 ${n} 個可選座位，開衝！`, { event: 'scout_hit', zone, seats: n });
 
   // 優先走「發現即提交」：直接從回應解析座位參數、用頁面函式提交，繞過進場
   const params = html ? parseFirstSeatParams(html) : null;
-  if (params && submitSeatByParams(params)) {
+  const direct = params ? submitSeatByParams(params) : false;
+  trace('submit_attempt', { zone, path: 'direct', parsed: !!params, ok: direct, seat: params ? params.slice(1, 5) : null });
+  if (direct) {
     await new Promise(r => setTimeout(r, 200));
     // 提交後被驗證擋下 → 暫停等解鎖
     if (findCaptchaInDoc(document, 0)) { pauseForCaptcha('選位提交', null); return; }
     // 等票數頁載入、自動填 1 張並按下一步
     const ok = await fillTicketCount();
+    trace('submit_result', { zone, path: 'direct', reachedPricePage: ok, sinceHitMs: Date.now() - strikeAt });
     if (ok) {
       window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'SEAT_FOUND', zone } }, '*');
       stop('FOUND');
@@ -944,6 +1333,7 @@ async function scoutStrike(zone, n, html) {
   // fallback：解析失敗或函式不可用 → 走舊的進場點擊
   log('[發現即提交] 無法使用，改用進場點擊');
   const res = await enterZoneAndPick(zone);
+  trace('submit_result', { zone, path: 'fallback', result: res, loadMs: lastSeatLoadMs, sinceHitMs: Date.now() - strikeAt });
   if (res === 'FOUND') return; // enterZoneAndPick 內已 stop('FOUND')
   if (res === 'DENIED')  { handleDeniedPause(); return; }
   if (res === 'CAPTCHA') { pauseForCaptcha('選位頁', null); return; }
@@ -955,6 +1345,8 @@ async function scoutStrike(zone, n, html) {
 // 發出單一區域的偵察請求；回應落地當下立即分類處理
 async function scoutFetch(zone) {
   scoutInFlight++;
+  const inflightAtSend = scoutInFlight;
+  const sentAt = Date.now();
   let status = 0, text = null;
   try {
     const resp = await fetch(scoutBuildUrl(zone), { cache: 'no-store' });
@@ -967,6 +1359,10 @@ async function scoutFetch(zone) {
 
   scoutWinTotal++;
   const kind = text === null ? 'ANOMALY' : classifyResponse(status, text);
+  trace('scout_resp', {
+    zone, kind, status, latencyMs: Date.now() - sentAt, inflight: inflightAtSend,
+    seats: kind === 'SEAT' ? countSeatN(text) : null, bytes: text ? text.length : 0,
+  });
 
   if (kind === 'SEAT') {
     scoutWinNormal++;
@@ -994,7 +1390,7 @@ async function scoutFetch(zone) {
   const limit = Math.max(4, (config.zones?.length || 2) * 2);
   if (scoutConsecAnomaly >= limit) {
     if (timer) { clearTimeout(timer); timer = null; }
-    log(`⚠️ 連續 ${scoutConsecAnomaly} 個回應異常，停止搶票。請檢查頁面（可能 session 已失效）`);
+    log(`⚠️ 連續 ${scoutConsecAnomaly} 個回應異常，停止搶票。請檢查頁面（可能 session 已失效）`, { event: 'scout_anomaly_stop', count: scoutConsecAnomaly });
     window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'SCOUT_ANOMALY' } }, '*');
     stop('ANOMALY');
   }
@@ -1055,7 +1451,7 @@ function scoutTick() {
     zoneIndex = round; // 供 STATUS 查詢
     const normal = scoutWinNormal, total = scoutWinTotal;
     window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'SCOUT_ROUND', round, zones: zones.length, normal, total } }, '*');
-    log(`🛰️ 第 ${round} 輪掃完 ${zones.length} 區 · ${normal}/${total} 正常回應 · 無可選座位`);
+    log(`🛰️ 第 ${round} 輪掃完 ${zones.length} 區 · ${normal}/${total} 正常回應 · 無可選座位`, { event: 'scout_round', round, zones: zones.length, normal, total });
     scoutWinNormal = 0;
     scoutWinTotal = 0;
   }
@@ -1151,16 +1547,16 @@ function setMonitorOverride(zone, now) {
     monitorLockHits = 0;
     monitorHeartbeatTs = now; // 首次心跳排在切區後約 MONITOR_HEARTBEAT_MS，避免與切區 log 疊在一起
     const info = remainMap[zone];
-    log(`🎯 切換到有票區 ${zone}（剩餘 ${info ? info.remain : '?'}）→ 主模式改刷此區`);
+    log(`🎯 切換到有票區 ${zone}（剩餘 ${info ? info.remain : '?'}）→ 主模式改刷此區`, { event: 'remain_switch', zone, remain: info ? info.remain : null });
     window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'REMAIN_SWITCH', zone, remain: info ? info.remain : 0 } }, '*');
   }
 }
 
 function clearMonitorOverride() {
   if (!monitorOverride) return;
-  const zone = monitorOverride.zone;
+  const { zone, since } = monitorOverride;
   monitorOverride = null;
-  log(`↩️ ${zone} 售完且無其他有票區，回到指定區域輪刷`);
+  log(`↩️ ${zone} 售完且無其他有票區，回到指定區域輪刷`, { event: 'remain_revert', zone, lockedMs: Date.now() - since });
   window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'REMAIN_REVERT', zone } }, '*');
 }
 
@@ -1191,6 +1587,7 @@ function applyMonitorDecision() {
 async function monitorScan() {
   if (!isRunning || monitorInFlight) return;
   monitorInFlight = true;
+  const sentAt = Date.now();
   let status = 0, text = null;
   try {
     const resp = await fetch(monitorBuildUrl(), { cache: 'no-store' });
@@ -1200,10 +1597,16 @@ async function monitorScan() {
   monitorInFlight = false;
   if (!isRunning) return;
 
-  // 被擋：不動 remainMap、不干預；讓主模式的 Denied 處理去暫停
-  if (status === 403 || (text && text.includes('Access Denied'))) return;
-
   const rows = text ? parseRemainXml(text) : [];
+  const denied = status === 403 || !!(text && text.includes('Access Denied'));
+  trace('remain_scan', {
+    status, latencyMs: Date.now() - sentAt, denied, blocks: rows.length,
+    avail: rows.filter(r => r.remain > 0).map(r => ({ block: r.block, remain: r.remain })),
+  });
+
+  // 被擋：不動 remainMap、不干預；讓主模式的 Denied 處理去暫停
+  if (denied) return;
+
   if (!rows.length) return; // 解析失敗（非全部售完）→ 保留舊表，不清空
 
   remainMap = {};
@@ -1246,6 +1649,7 @@ function start(cfg) {
   zoneIndex = 0;
   deniedStreak = 0;
   startTime = Date.now();
+  logRunId = `run-${startTime}`;
   scoutBuildUrl = null;
   cycleFn = runCycle;
 
@@ -1293,7 +1697,15 @@ function start(cfg) {
     }
   }
 
-  log(`開始搶票！區域: [${cfg.zones.join(', ')}]，持續: ${cfg.durationMs / 60000} 分鐘`);
+  log(`開始搶票！區域: [${cfg.zones.join(', ')}]，持續: ${cfg.durationMs / 60000} 分鐘`, {
+    event: 'start',
+    mode: cycleFn === scoutTick ? 'scout' : 'blind',
+    zones: cfg.zones, excludeZones: cfg.excludeZones || [],
+    intervalMin: cfg.intervalMin, intervalMax: cfg.intervalMax,
+    scoutIntervalMin: cfg.scoutIntervalMin, scoutIntervalMax: cfg.scoutIntervalMax,
+    durationMs: cfg.durationMs,
+    monitor: monitorBuildUrl ? { interval: cfg.monitorInterval || 5, minRemain: cfg.monitorMinRemain || 1 } : null,
+  });
   cycleFn();
 }
 
@@ -1302,7 +1714,11 @@ function stop(reason) {
   if (timer) { clearTimeout(timer); timer = null; }
   if (monitorTimer) { clearTimeout(monitorTimer); monitorTimer = null; }
   monitorOverride = null;
-  log(`已停止（${reason || 'MANUAL'}）`);
+  log(`已停止（${reason || 'MANUAL'}）`, {
+    event: 'stop', reason: reason || 'MANUAL',
+    elapsedMs: startTime ? Date.now() - startTime : null,
+    attempts: cycleFn === scoutTick ? scoutReqCount : zoneIndex,
+  });
   window.postMessage({ [MSG_KEY]: true, dir: 'to-ext', payload: { action: 'STOPPED', reason } }, '*');
 }
 
@@ -1328,8 +1744,9 @@ window.__nolMsgHandler = (e) => {
   else if (msg.action === 'STATUS') payload = { isRunning, zoneIndex, elapsed: startTime ? Date.now() - startTime : 0 };
   else if (msg.action === 'WATCH_RESERVE')   { watchReserveBtn();           payload = { ok: true }; }
   else if (msg.action === 'STOP_WATCH')      { stopWatchReserveBtn();       payload = { ok: true }; }
-  else if (msg.action === 'WATCH_SEATMAP')   { watchSeatMap(msg.rows || [], msg.timeoutMin || 0); payload = { ok: true }; }
-  else if (msg.action === 'STOP_WATCH_SEATMAP') { stopWatchSeatMap();       payload = { ok: true }; }
+  else if (msg.action === 'WATCH_SEATMAP')   { payload = { ok: startWatchSeatMap(msg.rows || [], msg.timeoutMin || 0) }; }
+  else if (msg.action === 'STOP_WATCH_SEATMAP') { stopWatchSeatMap(); stopModalRecorder(); payload = { ok: true }; }
+  else if (msg.action === 'SCAN_SEAT_BLOCKS')   { payload = { ok: true, blocks: scanSeatBlocks() }; }
 
   window.postMessage({ [MSG_KEY]: true, dir: 'response', action: msg.action, payload }, '*');
 };

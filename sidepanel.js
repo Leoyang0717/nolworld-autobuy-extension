@@ -63,16 +63,91 @@ stopWatchReserveBtnEl.addEventListener('click', async () => {
 // ─── 座位圖監聽（React SVG 架構）──────────────────────────
 const watchSeatMapBtnEl     = document.getElementById('watchSeatMapBtn');
 const stopWatchSeatMapBtnEl = document.getElementById('stopWatchSeatMapBtn');
+const seatBlockListEl       = document.getElementById('seatBlockList');
+const blockSummaryEl        = document.getElementById('blockSummary');
+
+// 區域清單：key（如 001:212）-> { label, total, open }；勾選狀態另存，換場次也保留同代碼的勾選
+let seatBlocks = new Map();
+let seatBlocksChecked = new Set();
+
+// Mirrors blockLabel() in content-main.js: "001:212" -> "212", "001:003" -> "F3"
+function seatBlockLabel(key) {
+  const tail = String(key).split(':').pop();
+  const n = parseInt(tail, 10);
+  return Number.isFinite(n) && n < 100 ? `F${n}` : tail;
+}
+
+function renderSeatBlocks() {
+  if (!seatBlocks.size) return;
+  seatBlockListEl.innerHTML = '';
+  for (const [key, b] of seatBlocks) {
+    const chip = document.createElement('label');
+    chip.className = 'block-chip' + (seatBlocksChecked.has(key) ? ' checked' : '');
+    chip.title = `${key}${b.total ? `（共 ${b.total} 席）` : ''}`;
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = seatBlocksChecked.has(key);
+    cb.addEventListener('change', () => {
+      if (cb.checked) seatBlocksChecked.add(key); else seatBlocksChecked.delete(key);
+      chip.classList.toggle('checked', cb.checked);
+      updateBlockSummary();
+      saveSettings();
+    });
+    const name = document.createElement('span');
+    name.textContent = b.label;
+    const open = document.createElement('span');
+    open.className = 'open' + (b.open > 0 ? ' has' : '');
+    open.textContent = b.open;
+    chip.append(cb, name, open);
+    seatBlockListEl.appendChild(chip);
+  }
+  updateBlockSummary();
+}
+
+function updateBlockSummary() {
+  const picked = [...seatBlocksChecked].filter(k => seatBlocks.has(k)).length;
+  let openBlocks = 0;
+  seatBlocks.forEach(b => { if (b.open > 0) openBlocks++; });
+  blockSummaryEl.textContent = `${picked ? `已選 ${picked} 區` : '全場'} · ${openBlocks} 區有位`;
+}
+
+function selectedSeatBlocks() {
+  return [...seatBlocks.keys()].filter(k => seatBlocksChecked.has(k));
+}
+
+document.getElementById('scanBlocksBtn').addEventListener('click', async () => {
+  const res = await sendToWatchTab({ action: 'SCAN_SEAT_BLOCKS' });
+  if (!res?.ok) return;
+  if (!res.blocks.length) {
+    appendLog('⚠️ 找不到任何區塊：頁面可能停在純圖模式，請先放大到看得到座位格子再掃描', 'error');
+    return;
+  }
+  seatBlocks = new Map(res.blocks.map(b => [b.key, b]));
+  renderSeatBlocks();
+  const openOnes = res.blocks.filter(b => b.open > 0);
+  appendLog(`🔄 掃描到 ${res.blocks.length} 區${openOnes.length ? `，有位：${openOnes.map(b => `${b.label}×${b.open}`).join('、')}` : '，目前全部無位'}`, 'success');
+});
+
+document.getElementById('blocksAllBtn').addEventListener('click', () => {
+  seatBlocks.forEach((_, k) => seatBlocksChecked.add(k));
+  renderSeatBlocks();
+  saveSettings();
+});
+
+document.getElementById('blocksNoneBtn').addEventListener('click', () => {
+  seatBlocks.forEach((_, k) => seatBlocksChecked.delete(k));
+  renderSeatBlocks();
+  saveSettings();
+});
 
 watchSeatMapBtnEl.addEventListener('click', async () => {
-  const rowsRaw = document.getElementById('seatRowInput').value.trim();
-  const rows = rowsRaw ? rowsRaw.split(/[,，\s]+/).filter(Boolean) : [];
+  const rows = selectedSeatBlocks();
   const timeoutMin = parseInt(document.getElementById('seatMapTimeout').value) || 0;
   const res = await sendToWatchTab({ action: 'WATCH_SEATMAP', rows, timeoutMin });
   if (!res?.ok) return;
   watchSeatMapBtnEl.style.display     = 'none';
   stopWatchSeatMapBtnEl.style.display = 'block';
-  const desc = rows.length ? `row: [${rows.join(', ')}]` : '全場';
+  const desc = rows.length ? `[${rows.map(seatBlockLabel).join(', ')}]` : '全場';
   setStatus(`👁️ 監聽座位圖中（${desc}）...`, 'watching');
   appendLog(`▶ 開始監聽座位圖（${desc}）`, 'success');
 });
@@ -250,6 +325,7 @@ function saveSettings() {
     nolIntervalMax: parseInt(document.getElementById('intervalMax').value),
     nolDuration:    parseInt(document.getElementById('duration').value),
     nolSeatMapTimeout: parseInt(document.getElementById('seatMapTimeout').value) || 0,
+    nolSeatBlocksChecked: [...seatBlocksChecked],
     nolScoutMode:      modeScoutEl.checked,
     nolScoutReqMin: parseInt(document.getElementById('scoutIntervalMin').value) || 1000,
     nolScoutReqMax: parseInt(document.getElementById('scoutIntervalMax').value) || 1200,
@@ -260,13 +336,14 @@ function saveSettings() {
 }
 
 async function loadSettings() {
-  const s = await chrome.storage.local.get(['nolZones', 'nolExcludeZones', 'nolIntervalMin', 'nolIntervalMax', 'nolDuration', 'nolSeatMapTimeout', 'nolScoutMode', 'nolScoutReqMin', 'nolScoutReqMax', 'nolMonitorEnabled', 'nolMonitorInterval', 'nolMonitorMinRemain']);
+  const s = await chrome.storage.local.get(['nolZones', 'nolExcludeZones', 'nolIntervalMin', 'nolIntervalMax', 'nolDuration', 'nolSeatMapTimeout', 'nolSeatBlocksChecked', 'nolScoutMode', 'nolScoutReqMin', 'nolScoutReqMax', 'nolMonitorEnabled', 'nolMonitorInterval', 'nolMonitorMinRemain']);
   if (s.nolZones) { zones = s.nolZones; renderZones(); }
   if (s.nolExcludeZones) { excludeZones = s.nolExcludeZones; renderExcludeZones(); }
   if (s.nolIntervalMin) document.getElementById('intervalMin').value = s.nolIntervalMin;
   if (s.nolIntervalMax) document.getElementById('intervalMax').value = s.nolIntervalMax;
   if (s.nolDuration)    document.getElementById('duration').value    = s.nolDuration;
   if (s.nolSeatMapTimeout !== undefined) document.getElementById('seatMapTimeout').value = s.nolSeatMapTimeout;
+  if (Array.isArray(s.nolSeatBlocksChecked)) seatBlocksChecked = new Set(s.nolSeatBlocksChecked);
   if (s.nolScoutMode === false) { modeBlindEl.checked = true; modeScoutEl.checked = false; }
   if (s.nolScoutReqMin) document.getElementById('scoutIntervalMin').value = s.nolScoutReqMin;
   if (s.nolScoutReqMax) document.getElementById('scoutIntervalMax').value = s.nolScoutReqMax;
@@ -536,14 +613,45 @@ chrome.runtime.onMessage.addListener((msg) => {
   if (msg.action === 'SEATMAP_FOUND') {
     watchSeatMapBtnEl.style.display     = 'block';
     stopWatchSeatMapBtnEl.style.display = 'none';
-    setStatus('✅ 座位已自動選取並送出！請確認頁面', 'found');
-    appendLog(`🎯 座位已點擊：${msg.id}`, 'found');
+    setStatus('✅ 座位已送出，已進入選價頁！請確認頁面', 'found');
+    appendLog(`🎯 座位已送出並進入 Select Price：${msg.id}`, 'found');
     playFoundBeep();
     chrome.notifications.create({
       type: 'basic',
       iconUrl: 'icons/icon128.png',
       title: 'NOL World 座位搶到了！',
-      message: `已自動點擊座位 ${msg.id} 並送出 Submit！`,
+      message: `座位 ${msg.id} 已送出並進入選價頁，請盡快完成付款！`,
+      priority: 2,
+    });
+  }
+
+  // 監聽中頁面每次更新座位就推一次；還沒掃描過時直接用它建出區域清單
+  if (msg.action === 'SEATMAP_COUNTS') {
+    for (const [key, open] of Object.entries(msg.counts || {})) {
+      const b = seatBlocks.get(key);
+      if (b) b.open = open;
+      else seatBlocks.set(key, { key, label: seatBlockLabel(key), total: 0, open });
+    }
+    renderSeatBlocks();
+  }
+
+  if (msg.action === 'SEATMAP_STOPPED') {
+    watchSeatMapBtnEl.style.display     = 'block';
+    stopWatchSeatMapBtnEl.style.display = 'none';
+    const STOP_TEXT = {
+      EXPIRED:        ['⏰ 選位時間已到', '頁面 10 分鐘選位時限已到，請重新進入選座頁後再開始監聽。'],
+      UNKNOWN_DIALOG: ['⚠️ 出現未知彈窗', '程式不認得這個彈窗，已停止避免誤按，請到頁面手動處理（原文見日誌）。'],
+    };
+    const [title, body] = STOP_TEXT[msg.reason] || ['⚠️ 座位圖監聽已停止', '狀態不明確（可能選到一半），請到頁面手動確認。'];
+    setStatus(`${title}，監聽已停止`, 'error');
+    appendLog(`${title}：座位圖監聽已自動停止（${msg.reason}），詳見上方日誌`, 'error');
+    playWarningBeep();
+    // NO_SVG just means wrong page; only mid-purchase stops need a loud notification
+    if (msg.reason !== 'NO_SVG') chrome.notifications.create({
+      type: 'basic',
+      iconUrl: 'icons/icon128.png',
+      title,
+      message: body,
       priority: 2,
     });
   }

@@ -124,6 +124,29 @@
 
     .zone-tag-remove:hover { color: #f44336; }
 
+    /* 座位圖區域勾選 */
+    .block-toolbar { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; flex-wrap: wrap; }
+    .btn-mini {
+      border: 1px solid #ccc; background: #fff; border-radius: 4px;
+      padding: 3px 8px; font-size: 12px; cursor: pointer;
+    }
+    .btn-mini:hover { background: #f5f5f5; }
+    .block-summary { font-size: 11px; color: #666; margin-left: auto; }
+    .block-list {
+      display: flex; flex-wrap: wrap; gap: 4px;
+      max-height: 160px; overflow-y: auto;
+      border: 1px solid #ddd; border-radius: 6px; padding: 6px;
+    }
+    .block-chip {
+      display: inline-flex; align-items: center; gap: 3px;
+      border: 1px solid #ddd; border-radius: 4px; padding: 2px 6px;
+      font-size: 12px; cursor: pointer; user-select: none; background: #fafafa;
+    }
+    .block-chip input { margin: 0; }
+    .block-chip.checked { background: #e8f5e9; border-color: #a5d6a7; color: #2e7d32; font-weight: bold; }
+    .block-chip .open { font-size: 11px; color: #bbb; }
+    .block-chip .open.has { color: #fff; background: #43a047; border-radius: 3px; padding: 0 4px; }
+
     #zoneInput {
       border: none;
       outline: none;
@@ -251,9 +274,17 @@
   <div class="section">
     <div class="section-title">🎯 座位圖監聽（選座頁）</div>
     <div class="form-group">
-      <label>指定 Row（格式：003:009，逗號分隔；留空=全場）</label>
-      <input type="text" id="seatRowInput" placeholder="例如：003:009, 003:010（留空=全場）">
-      <div class="hint">💡 開售後座位由灰轉紫/綠時立即點擊並按 Submit</div>
+      <label>指定區域（勾選要搶的區；都不勾＝全場）</label>
+      <div class="block-toolbar">
+        <button class="btn-mini" id="scanBlocksBtn">🔄 掃描區域</button>
+        <button class="btn-mini" id="blocksAllBtn">全選</button>
+        <button class="btn-mini" id="blocksNoneBtn">清除</button>
+        <span class="block-summary" id="blockSummary"></span>
+      </div>
+      <div class="block-list" id="seatBlockList">
+        <div class="hint">先把座位圖放大到看得到座位格子，再按「掃描區域」</div>
+      </div>
+      <div class="hint">💡 綠色數字＝目前可選座位數，監聽中每次頁面更新座位都會即時刷新</div>
     </div>
     <div class="form-group">
       <label>監聽時限（分鐘，0=無限）</label>
