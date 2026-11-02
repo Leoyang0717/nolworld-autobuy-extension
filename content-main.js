@@ -451,6 +451,29 @@ function isSeatAvailable(circle) {
   return cls.includes('js-seat') && !cls.includes('SeatMap_disabled__') && !cls.includes('SeatMap_selected__');
 }
 
+// Outline one block on the page for a few seconds: block codes don't say which drawn area they are
+// (area names live in the background image, not the DOM)
+let blockHighlightEl = null;
+let blockHighlightTimer = null;
+function highlightSeatBlock(key) {
+  if (blockHighlightTimer) { clearTimeout(blockHighlightTimer); blockHighlightTimer = null; }
+  blockHighlightEl?.remove();
+  blockHighlightEl = null;
+  const r = document.getElementById(`seat_block_${key}`)?.getBoundingClientRect();
+  if (!r || (!r.width && !r.height)) return false;
+  const pad = 6;
+  blockHighlightEl = document.createElement('div');
+  blockHighlightEl.style.cssText = `position:fixed;left:${r.left - pad}px;top:${r.top - pad}px;width:${r.width + pad * 2}px;height:${r.height + pad * 2}px;`
+    + 'border:3px solid #ff3d00;border-radius:6px;background:rgba(255,61,0,.12);pointer-events:none;z-index:2147483647;';
+  const tag = document.createElement('div');
+  tag.textContent = `${blockLabel(key)}（${key}）`;
+  tag.style.cssText = 'position:absolute;top:-24px;left:-3px;background:#ff3d00;color:#fff;font:bold 13px sans-serif;padding:2px 6px;border-radius:4px;white-space:nowrap;';
+  blockHighlightEl.appendChild(tag);
+  document.body.appendChild(blockHighlightEl);
+  blockHighlightTimer = setTimeout(() => { blockHighlightEl?.remove(); blockHighlightEl = null; }, 2500);
+  return true;
+}
+
 // List every seat block currently drawn on the map (only present once zoomed in to seat level)
 function scanSeatBlocks() {
   return [...document.querySelectorAll('svg g[id^="seat_block_"]')].map(g => {
@@ -1747,6 +1770,7 @@ window.__nolMsgHandler = (e) => {
   else if (msg.action === 'WATCH_SEATMAP')   { payload = { ok: startWatchSeatMap(msg.rows || [], msg.timeoutMin || 0) }; }
   else if (msg.action === 'STOP_WATCH_SEATMAP') { stopWatchSeatMap(); stopModalRecorder(); payload = { ok: true }; }
   else if (msg.action === 'SCAN_SEAT_BLOCKS')   { payload = { ok: true, blocks: scanSeatBlocks() }; }
+  else if (msg.action === 'HIGHLIGHT_SEAT_BLOCK') { payload = { ok: highlightSeatBlock(msg.key) }; }
 
   window.postMessage({ [MSG_KEY]: true, dir: 'response', action: msg.action, payload }, '*');
 };

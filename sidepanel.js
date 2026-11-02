@@ -83,7 +83,8 @@ function renderSeatBlocks() {
   for (const [key, b] of seatBlocks) {
     const chip = document.createElement('label');
     chip.className = 'block-chip' + (seatBlocksChecked.has(key) ? ' checked' : '');
-    chip.title = `${key}${b.total ? `（共 ${b.total} 席）` : ''}`;
+    const baseTitle = `${key}${b.total ? `（共 ${b.total} 席）` : ''}`;
+    chip.title = baseTitle;
     const cb = document.createElement('input');
     cb.type = 'checkbox';
     cb.checked = seatBlocksChecked.has(key);
@@ -99,6 +100,11 @@ function renderSeatBlocks() {
     open.className = 'open' + (b.open > 0 ? ' has' : '');
     open.textContent = b.open;
     chip.append(cb, name, open);
+    // Hover = outline this block on the page, since codes don't tell which drawn area is which
+    chip.addEventListener('mouseenter', async () => {
+      const res = await sendToWatchTab({ action: 'HIGHLIGHT_SEAT_BLOCK', key });
+      if (res) chip.title = res.ok ? baseTitle : `${key}：畫面上目前沒有畫出這一區（可能在畫面外或未放大）`;
+    });
     seatBlockListEl.appendChild(chip);
   }
   updateBlockSummary();
